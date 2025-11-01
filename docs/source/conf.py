@@ -27,8 +27,8 @@ sys.modules["obliquetree.src.utils"] = mock_utils_module
 project = "obliquetree"
 copyright = "2025, Samet Çopur"
 author = "Samet Çopur"
-version = "1.0.3"
-release = "1.0.3"
+version = "1.0.4"
+release = "1.0.4"
 
 # Extensions configuration
 extensions = [
