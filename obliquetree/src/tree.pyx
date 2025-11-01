@@ -64,6 +64,7 @@ cdef TreeNode* build_tree_recursive(
     node.categories_go_left = NULL
     node.n_samples = n_samples
     node.n_classes = n_classes
+    node.value_multiclass = NULL
 
     if n_classes > 2:
         calculate_node_value_multiclass(sample_weight, y, sample_indices, n_samples, n_classes, &node.value_multiclass)

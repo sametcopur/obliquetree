@@ -901,6 +901,7 @@ cdef double find_best_split_for_categorical_multiclass(
                         for j in range(unique_count):
                             if stats[j].class_weights != NULL:
                                 free(stats[j].class_weights)
+                                stats[j].class_weights = NULL
                         with gil:
                             raise MemoryError()
                     
