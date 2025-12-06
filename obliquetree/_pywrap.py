@@ -378,7 +378,7 @@ class BaseTree(TreeClassifier):
         if self.use_oblique:
             if np.any(np.isnan(X)) or np.any(np.isinf(X)):
                 raise ValueError(
-                    "X cannot contain NaN or Inf values when use_oblique is False"
+                    "X cannot contain NaN or Inf values when use_oblique is True"
                 )
 
         max_possible_pairs = (
