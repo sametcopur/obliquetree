@@ -11,10 +11,9 @@ authors = [
 ]
 description = "Traditional and Oblique Decision Tree"
 readme = "README.md"
-license = {text = "MIT License"}
+license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
 keywords = [
