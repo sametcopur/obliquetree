@@ -117,6 +117,7 @@ class BaseTree(TreeClassifier):
         self.random_state = self._validate_random_state(random_state)
         self.categories = self._validate_categories(categories)
         self._fit = False
+        self._categories: dict[int, NDArray]
 
         # Initialize the TreeClassifier
         super().__init__(
@@ -317,7 +318,7 @@ class BaseTree(TreeClassifier):
         self.n_classes = self._setup_task(y)
 
         # Validate categorical features
-        self._validate_categories_in_data(X)
+        self._validate_categories_in_data(X, is_fit=True)
 
         # Warn if the number of feature combinations is too large for oblique splits
         if self.use_oblique:
@@ -414,7 +415,7 @@ class BaseTree(TreeClassifier):
         else:
             return 1  # Regression
 
-    def _validate_categories_in_data(self, X: NDArray) -> None:
+    def _validate_categories_in_data(self, X: NDArray, is_fit: bool) -> None:
         if self.categories:
             for col_idx in self.categories:
                 # Kategori indeksi matris boyutlarını aşmamalı
@@ -428,6 +429,25 @@ class BaseTree(TreeClassifier):
                 raise ValueError(
                     "X contains negative values in the specified category columns, which are not allowed."
                 )
+
+            if np.isnan(X[:, self.categories]).any():
+                raise ValueError(
+                    "X contains null values in the specified category columns. Please encode them before passing."
+                )
+
+            if is_fit:
+                self._categories = {
+                    idx: np.unique(X[:, idx]) for idx in self.categories
+                }
+
+            else:
+                for idx in self.categories:
+                    unknown = np.setdiff1d(np.unique(X[:, idx]), self._categories[idx])
+                    if len(unknown) > 0:
+                        raise ValueError(
+                            f"Unknown categories in column {idx}: {unknown}. "
+                            f"Available categories: {self._categories[idx]}"
+                        )
 
     def _warn_large_combinations(self, n_features: int) -> None:
         total_combinations = comb(n_features, self.n_pair)
@@ -467,6 +487,8 @@ class BaseTree(TreeClassifier):
             raise ValueError(
                 f"Expected a 2D array for input samples, but got an array with {X.ndim} dimensions. "
             )
+
+        self._validate_categories_in_data(X, is_fit=False)
 
         return super().predict(X)
 
