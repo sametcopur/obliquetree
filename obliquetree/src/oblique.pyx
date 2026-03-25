@@ -300,9 +300,13 @@ cdef double fun_and_grad_reg_nogil(
     for i in range(N):
         temp_vec2[i] = dp_dz[i] * sample_weight[i]
     matvec_T(X, temp_vec2, temp_grad, N, d, lda)
+    for i in range(N):
+        temp_vec1[i] = temp_vec2[i] * y[i]
+    matvec_T(X, temp_vec1, temp_vec2, N, d, lda)
 
     for j in range(d):
-        dS_L_w = temp_grad[j]; dM_L_w = temp_grad[j]
+        dS_L_w = temp_grad[j]
+        dM_L_w = temp_vec2[j]
         d_mL_w = (S_L * dM_L_w - M_L * dS_L_w) / (S_L * S_L)
         d_mR_w = (S_R * (-dM_L_w) - M_R * (-dS_L_w)) / (S_R * S_R)
         for i in range(N):
