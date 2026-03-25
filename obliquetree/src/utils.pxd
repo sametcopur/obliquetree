@@ -37,5 +37,5 @@ cdef void populate_indices(
     const int* best_nan_indices) noexcept nogil
 
 cdef void sort_pointer_array_count(SortItem* items, int* count, SortItem* output, const int n_samples, const int n_unique, const int offset) noexcept nogil
-cdef void analyze_X(const double[::1, :] X, bint* is_integer, int* min_values, int* max_range)
+cdef void analyze_X(const double[::1, :] X, bint* is_integer)
 cdef int** generate_permutations(const int n_classes, int* perm_count) noexcept nogil

@@ -1,5 +1,6 @@
 from cython.parallel cimport prange
 
+from libc.limits cimport INT_MAX, INT_MIN
 from libc.math cimport INFINITY
 from libc.stdlib cimport malloc, free
 
@@ -13,6 +14,9 @@ from .metric cimport (
 from .oblique cimport analyze
 from .utils cimport sort_pointer_array, sort_pointer_array_count
 
+DEF COUNT_SORT_RANGE_FACTOR = 8
+DEF MIN_PARALLEL_FEATURE_WORK = 32768
+
 
 cdef inline void free_oblique_split(double** x, int** pair) noexcept nogil:
     if x[0] != NULL:
@@ -21,6 +25,29 @@ cdef inline void free_oblique_split(double** x, int** pair) noexcept nogil:
     if pair[0] != NULL:
         free(pair[0])
         pair[0] = NULL
+
+
+cdef inline bint should_use_count_sort(
+    const bint is_integer_feature,
+    const int n_non_nans,
+    const int min_value,
+    const int max_value,
+    int* out_value_range,
+) noexcept nogil:
+    cdef long long value_range
+
+    if not is_integer_feature or n_non_nans <= 1:
+        return False
+
+    value_range = <long long>max_value - <long long>min_value + 1
+    if value_range <= 0 or value_range > INT_MAX:
+        return False
+
+    if value_range > <long long>COUNT_SORT_RANGE_FACTOR * n_non_nans:
+        return False
+
+    out_value_range[0] = <int>value_range
+    return True
 
 
 cdef inline bint sample_goes_left(
@@ -125,8 +152,6 @@ cdef double evaluate_feature_exact(
     const int feature_idx,
     const bint is_categorical_feature,
     const int min_samples_leaf,
-    const int min_value,
-    const int max_unique_range,
     const bint is_integer_feature,
     double* out_threshold,
     int* out_left_count,
@@ -142,8 +167,14 @@ cdef double evaluate_feature_exact(
     cdef int idx
     cdef int n_nans = 0
     cdef int n_non_nans = 0
+    cdef int local_min_value = 0
+    cdef int local_max_value = 0
+    cdef int local_value_range = 0
+    cdef int local_int_value = 0
     cdef double x_val
     cdef double impurity = INFINITY
+    cdef bint local_is_integer = is_integer_feature
+    cdef bint has_integer_values = False
 
     out_status[0] = 0
     out_threshold[0] = 0.0
@@ -169,21 +200,6 @@ cdef double evaluate_feature_exact(
             free(local_nan_indices)
             return INFINITY
 
-    if is_integer_feature:
-        local_count_unique_array = <int*>malloc(max_unique_range * sizeof(int))
-        local_count_sort_buffer = <SortItem*>malloc(n_samples * sizeof(SortItem))
-        if local_count_unique_array == NULL or local_count_sort_buffer == NULL:
-            out_status[0] = 1
-            if local_count_unique_array != NULL:
-                free(local_count_unique_array)
-            if local_count_sort_buffer != NULL:
-                free(local_count_sort_buffer)
-            if local_categorical_stats != NULL:
-                free(local_categorical_stats)
-            free(local_sort_buffer)
-            free(local_nan_indices)
-            return INFINITY
-
     for i in range(n_samples):
         idx = sample_indices[i]
         x_val = X[idx, feature_idx]
@@ -194,17 +210,53 @@ cdef double evaluate_feature_exact(
         else:
             local_sort_buffer[n_non_nans].value = x_val
             local_sort_buffer[n_non_nans].index = idx
+
+            if local_is_integer:
+                if x_val < INT_MIN or x_val > INT_MAX:
+                    local_is_integer = False
+                else:
+                    local_int_value = <int>x_val
+                    if not has_integer_values:
+                        local_min_value = local_int_value
+                        local_max_value = local_int_value
+                        has_integer_values = True
+                    else:
+                        if local_int_value < local_min_value:
+                            local_min_value = local_int_value
+                        elif local_int_value > local_max_value:
+                            local_max_value = local_int_value
+
             n_non_nans += 1
 
     if n_non_nans >= 2 * min_samples_leaf:
-        if is_integer_feature:
+        if should_use_count_sort(
+            local_is_integer and has_integer_values,
+            n_non_nans,
+            local_min_value,
+            local_max_value,
+            &local_value_range,
+        ):
+            local_count_unique_array = <int*>malloc(local_value_range * sizeof(int))
+            local_count_sort_buffer = <SortItem*>malloc(n_non_nans * sizeof(SortItem))
+            if local_count_unique_array == NULL or local_count_sort_buffer == NULL:
+                out_status[0] = 1
+                if local_count_unique_array != NULL:
+                    free(local_count_unique_array)
+                if local_count_sort_buffer != NULL:
+                    free(local_count_sort_buffer)
+                if local_categorical_stats != NULL:
+                    free(local_categorical_stats)
+                free(local_sort_buffer)
+                free(local_nan_indices)
+                return INFINITY
+
             sort_pointer_array_count(
                 local_sort_buffer,
                 local_count_unique_array,
                 local_count_sort_buffer,
                 n_non_nans,
-                max_unique_range,
-                min_value,
+                local_value_range,
+                local_min_value,
             )
         else:
             sort_pointer_array(local_sort_buffer, n_non_nans)
@@ -261,10 +313,6 @@ cdef TreeNode* build_tree_recursive(
     const bint* is_categorical,
     CategoryStat* categorical_stats,
     const double[::1] sample_weight,
-    const int* min_values,
-    const int max_unique_range,
-    int* count_unique_array,
-    SortItem* count_sort_buffer,
     const bint* is_integer,
 ) noexcept nogil:
     cdef TreeNode* node = <TreeNode*>malloc(sizeof(TreeNode))
@@ -298,8 +346,18 @@ cdef TreeNode* build_tree_recursive(
     cdef int best_n_categorical = 0
     cdef bint missing_go_left = True
     cdef bint best_missing_go_left = True
+    cdef bint categorical_is_integer = False
+    cdef bint categorical_has_integer_values = False
+    cdef bint use_feature_threads
     cdef double best_threshold = 0.0
     cdef double x_val
+    cdef long long feature_work
+    cdef int categorical_min_value = 0
+    cdef int categorical_max_value = 0
+    cdef int categorical_value_range = 0
+    cdef int categorical_int_value = 0
+    cdef SortItem* local_count_sort_buffer = NULL
+    cdef int* local_count_unique_array = NULL
 
     if node == NULL:
         with gil:
@@ -483,7 +541,15 @@ cdef TreeNode* build_tree_recursive(
         feature_status[f_idx] = 0
         feature_missing_left[f_idx] = True
 
-    for f_idx in prange(n_features, nogil=True, schedule="guided", use_threads_if=n_features > 1):
+    feature_work = <long long>n_features * <long long>n_samples
+    use_feature_threads = n_features > 1 and feature_work >= MIN_PARALLEL_FEATURE_WORK
+
+    for f_idx in prange(
+        n_features,
+        nogil=True,
+        schedule="guided",
+        use_threads_if=use_feature_threads,
+    ):
         feature_impurities[f_idx] = evaluate_feature_exact(
             task,
             n_classes,
@@ -495,8 +561,6 @@ cdef TreeNode* build_tree_recursive(
             f_idx,
             is_categorical[f_idx],
             min_samples_leaf,
-            min_values[f_idx],
-            max_unique_range,
             is_integer[f_idx],
             &feature_thresholds[f_idx],
             &feature_left_counts[f_idx],
@@ -533,6 +597,8 @@ cdef TreeNode* build_tree_recursive(
     if best_feature >= 0 and is_categorical[best_feature]:
         n_nans = 0
         n_non_nans = 0
+        categorical_is_integer = is_integer[best_feature]
+        categorical_has_integer_values = False
 
         for i in range(n_samples):
             idx = sample_indices[i]
@@ -544,17 +610,50 @@ cdef TreeNode* build_tree_recursive(
             else:
                 sort_buffer[n_non_nans].value = x_val
                 sort_buffer[n_non_nans].index = idx
+
+                if categorical_is_integer:
+                    if x_val < INT_MIN or x_val > INT_MAX:
+                        categorical_is_integer = False
+                    else:
+                        categorical_int_value = <int>x_val
+                        if not categorical_has_integer_values:
+                            categorical_min_value = categorical_int_value
+                            categorical_max_value = categorical_int_value
+                            categorical_has_integer_values = True
+                        else:
+                            if categorical_int_value < categorical_min_value:
+                                categorical_min_value = categorical_int_value
+                            elif categorical_int_value > categorical_max_value:
+                                categorical_max_value = categorical_int_value
+
                 n_non_nans += 1
 
         if n_non_nans >= 2 * min_samples_leaf:
-            if is_integer[best_feature]:
+            if should_use_count_sort(
+                categorical_is_integer and categorical_has_integer_values,
+                n_non_nans,
+                categorical_min_value,
+                categorical_max_value,
+                &categorical_value_range,
+            ):
+                local_count_unique_array = <int*>malloc(categorical_value_range * sizeof(int))
+                local_count_sort_buffer = <SortItem*>malloc(n_non_nans * sizeof(SortItem))
+                if local_count_unique_array == NULL or local_count_sort_buffer == NULL:
+                    if local_count_unique_array != NULL:
+                        free(local_count_unique_array)
+                    if local_count_sort_buffer != NULL:
+                        free(local_count_sort_buffer)
+                    free_oblique_split(&best_oblique_x, &best_oblique_pair)
+                    with gil:
+                        raise MemoryError()
+
                 sort_pointer_array_count(
                     sort_buffer,
-                    count_unique_array,
-                    count_sort_buffer,
+                    local_count_unique_array,
+                    local_count_sort_buffer,
                     n_non_nans,
-                    max_unique_range,
-                    min_values[best_feature],
+                    categorical_value_range,
+                    categorical_min_value,
                 )
             else:
                 sort_pointer_array(sort_buffer, n_non_nans)
@@ -575,6 +674,13 @@ cdef TreeNode* build_tree_recursive(
                 &missing_go_left,
                 task,
             )
+
+            if local_count_unique_array != NULL:
+                free(local_count_unique_array)
+                local_count_unique_array = NULL
+            if local_count_sort_buffer != NULL:
+                free(local_count_sort_buffer)
+                local_count_sort_buffer = NULL
 
             if impurity_c < INFINITY:
                 best_threshold = threshold_c
@@ -678,10 +784,6 @@ cdef TreeNode* build_tree_recursive(
         is_categorical,
         categorical_stats,
         sample_weight,
-        min_values,
-        max_unique_range,
-        count_unique_array,
-        count_sort_buffer,
         is_integer,
     )
 
@@ -708,10 +810,6 @@ cdef TreeNode* build_tree_recursive(
         is_categorical,
         categorical_stats,
         sample_weight,
-        min_values,
-        max_unique_range,
-        count_unique_array,
-        count_sort_buffer,
         is_integer,
     )
 

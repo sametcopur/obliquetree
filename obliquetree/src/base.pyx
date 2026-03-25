@@ -107,7 +107,6 @@ cdef class TreeClassifier:
         cdef int n_samples = X.shape[0]
         cdef int n_columns = X.shape[1]
         cdef int i
-        cdef int max_unique_range = 0
         
         # Temel bellek ayırma işlemleri
         cdef SortItem* sort_buffer = NULL
@@ -115,10 +114,7 @@ cdef class TreeClassifier:
         cdef int* nan_indices = NULL
         cdef bint* is_categorical = NULL
         cdef CategoryStat* categorical_stats = NULL
-        cdef int* count_unique_array = NULL
-        cdef int* min_values = NULL
         cdef bint* is_integer = NULL
-        cdef SortItem* count_sort_buffer = NULL
         
     
         try:
@@ -133,23 +129,15 @@ cdef class TreeClassifier:
             sample_indices = <int*>malloc(n_samples * sizeof(int))
             nan_indices = <int*>malloc(n_samples * sizeof(int))
             is_categorical = <bint*>calloc(n_columns, sizeof(bint))
-            min_values = <int*>malloc(n_columns * sizeof(int))
             is_integer = <bint*>malloc(n_columns * sizeof(bint))
 
             if ((sort_buffer == NULL) or (sample_indices == NULL) or 
                 (nan_indices == NULL) or (is_categorical == NULL) or
-                 (min_values == NULL) or (is_integer == NULL)
+                 (is_integer == NULL)
                 ):
                 raise MemoryError()
 
-            analyze_X(X, is_integer, min_values, &max_unique_range)
-
-            if max_unique_range != 0:
-                count_unique_array = <int*>malloc(max_unique_range * sizeof(int))
-                count_sort_buffer = <SortItem*>malloc(n_samples * sizeof(SortItem))
-
-                if (count_unique_array == NULL) or (count_sort_buffer == NULL):
-                    raise MemoryError()
+            analyze_X(X, is_integer)
 
             if self.cat_:
                 categorical_stats = <CategoryStat*>malloc(n_samples * sizeof(CategoryStat))
@@ -188,10 +176,6 @@ cdef class TreeClassifier:
                 is_categorical,
                 categorical_stats,
                 sample_weight,
-                min_values,
-                max_unique_range,
-                count_unique_array,
-                count_sort_buffer,
                 is_integer,
             )
             
@@ -203,14 +187,7 @@ cdef class TreeClassifier:
             free(sample_indices)
             free(nan_indices)
             free(is_categorical)
-            free(min_values)
             free(is_integer)
-
-            if count_sort_buffer != NULL:
-                free(count_sort_buffer)
-
-            if count_unique_array != NULL:
-                free(count_unique_array)
 
             if categorical_stats != NULL:
                 free(categorical_stats)

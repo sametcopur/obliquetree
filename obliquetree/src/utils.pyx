@@ -376,48 +376,30 @@ cdef void sort_pointer_array_count(SortItem* items, int* count, SortItem* output
     for i in range(n_samples):
         items[i] = output[i]
 
-cdef void analyze_X(const double[::1, :] X, bint* is_integer, int* min_values, int* max_range):
+cdef void analyze_X(const double[::1, :] X, bint* is_integer):
     cdef int n_columns = X.shape[1]
     cdef int n_rows = X.shape[0]
     cdef int i, j
-    cdef double min_val, max_val, current_val, current_range
+    cdef double current_val
     cdef bint is_int
-    
-    max_range[0] = 0  # Initialize max_range
+    cdef bint has_non_nan
     
     for j in range(n_columns):
-        # Initialize values for this column
         is_int = True
-        min_val = X[0, j]
-        max_val = X[0, j]
-        
-        # Analyze each value in the column
+        has_non_nan = False
+
         for i in range(n_rows):
             current_val = X[i, j]
-            
-            # Check if value is integer using floor
+
+            if current_val != current_val:
+                continue
+
+            has_non_nan = True
             if current_val != floor(current_val):
                 is_int = False
-                is_integer[j] = False
-                break  # No need to check rest of the column
-            
-            # Update min and max values
-            if current_val < min_val:
-                min_val = current_val
-            if current_val > max_val:
-                max_val = current_val
-        
-        # Store results for this column
-        is_integer[j] = is_int
-        if is_int:
-            min_values[j] = int(min_val)
-            
-            # Update max_range if this column's range is larger
-            current_range = max_val - min_val
-            if int(current_range) > max_range[0]:
-                max_range[0] = int(current_range)
+                break
 
-    max_range[0] += 1
+        is_integer[j] = is_int and has_non_nan
 
 
 

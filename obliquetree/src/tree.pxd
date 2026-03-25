@@ -64,9 +64,5 @@ cdef TreeNode* build_tree_recursive(
     const bint* is_categorical,
     CategoryStat* categorical_stats,
     const double[::1] sample_weight,
-    const int* min_values,
-    const int max_unique_range,
-    int* count_unique_array,
-    SortItem* count_sort_buffer,
     const bint* is_integer,
 )  noexcept nogil
