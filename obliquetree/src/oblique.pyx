@@ -10,7 +10,6 @@ cimport openmp
 
 from .utils cimport sort_pointer_array
 
-from itertools import combinations
 
 # ---------------------------------------------------------------------------
 # Helper inlines
@@ -22,34 +21,48 @@ cdef inline double sigmoid(const double x) noexcept nogil:
     return 1.0 / (1.0 + exp(-x))
 
 # ---------------------------------------------------------------------------
-# Inline mat-vec for small d  (avoids BLAS call overhead + thread-safety)
+# Gathered mat-vec:  work directly on global X via sample_indices + col_indices
+#   X is the *original* (full_N x full_d) Fortran-order matrix.
+#   We read only the rows in sample_indices[0..N) and cols in cols[0..d).
 # ---------------------------------------------------------------------------
-cdef inline void matvec_N(const double* X, const double* w,
-                          double* out, Py_ssize_t N, Py_ssize_t d,
-                          Py_ssize_t lda) noexcept nogil:
-    """out[i] = sum_j X[i + j*lda] * w[j]   (Fortran col-major)"""
+cdef inline void matvec_gather_N(
+    const double* X, Py_ssize_t full_N,          # global X ptr + leading dim
+    const int* row_idx, Py_ssize_t N,             # which rows
+    const int* col_idx, Py_ssize_t d,             # which cols
+    const double* w,                              # (d,)
+    double* out,                                  # (N,)
+) noexcept nogil:
+    """out[i] = sum_j  X[row_idx[i], col_idx[j]] * w[j]"""
     cdef Py_ssize_t i, j
+    cdef int ri
     for i in range(N):
         out[i] = 0.0
     for j in range(d):
         for i in range(N):
-            out[i] += X[i + j * lda] * w[j]
+            out[i] += X[row_idx[i] + <Py_ssize_t>col_idx[j] * full_N] * w[j]
 
-cdef inline void matvec_T(const double* X, const double* v,
-                          double* out, Py_ssize_t N, Py_ssize_t d,
-                          Py_ssize_t lda) noexcept nogil:
-    """out[j] = sum_i X[i + j*lda] * v[i]   (Fortran col-major, transpose)"""
+
+cdef inline void matvec_gather_T(
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, Py_ssize_t N,
+    const int* col_idx, Py_ssize_t d,
+    const double* v,                              # (N,)
+    double* out,                                  # (d,)
+) noexcept nogil:
+    """out[j] = sum_i  X[row_idx[i], col_idx[j]] * v[i]"""
     cdef Py_ssize_t i, j
     for j in range(d):
         out[j] = 0.0
         for i in range(N):
-            out[j] += X[i + j * lda] * v[i]
+            out[j] += X[row_idx[i] + <Py_ssize_t>col_idx[j] * full_N] * v[i]
+
 
 # ---------------------------------------------------------------------------
-# Loss / gradient  (pointer-based, fully nogil)
+# Loss / gradient  (pointer-based, fully nogil, gathered access)
 # ---------------------------------------------------------------------------
 cdef double fun_and_grad_nogil(
-    const double* X,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y,
     const double* sample_weight,
     double* w,
@@ -68,7 +81,7 @@ cdef double fun_and_grad_nogil(
     double* dS_R_w,
     double* y_dp_vec) noexcept nogil:
 
-    cdef Py_ssize_t i, lda = N
+    cdef Py_ssize_t i
     cdef double S_L, S_R, p_y_sum, p_1_y_sum, tmp
     cdef double P_L1, P_R1
     cdef double impurity_L, impurity_R
@@ -80,10 +93,9 @@ cdef double fun_and_grad_nogil(
     cdef double one_minus_tmp, yi, sw_i
     cdef double dp_dz_i, dS_R_w_i, dP_L1_w_i, dP_R1_w_i
 
-    # 1) z = X dot w
-    matvec_N(X, w, z, N, d, lda)
+    # z = X[rows, cols] @ w
+    matvec_gather_N(X, full_N, row_idx, N, col_idx, d, w, z)
 
-    # 2) weighted probs and sums
     S_L = 0.0
     p_y_sum = 0.0
     p_1_y_sum = 0.0
@@ -104,7 +116,6 @@ cdef double fun_and_grad_nogil(
         y_dp_vec[i] = yi * dp_dz_i
 
     S_R = total_weight - S_L
-
     S_L += eps
     S_R += eps
 
@@ -114,8 +125,7 @@ cdef double fun_and_grad_nogil(
     impurity_R = P_R1 * (1.0 - P_R1)
     loss = S_L * impurity_L + S_R * impurity_R
 
-    # grad_w = X^T dp_dz
-    matvec_T(X, dp_dz, grad_w, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, dp_dz, grad_w)
 
     for i in range(d):
         dS_R_w[i] = -grad_w[i]
@@ -125,8 +135,7 @@ cdef double fun_and_grad_nogil(
     factor_L = 1.0 - 2.0 * P_L1
     factor_R = 1.0 - 2.0 * P_R1
 
-    # tmp_y_dp_vec = X^T y_dp_vec
-    matvec_T(X, y_dp_vec, tmp_y_dp_vec, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, y_dp_vec, tmp_y_dp_vec)
 
     for i in range(d):
         tmp_y_dp = tmp_y_dp_vec[i]
@@ -147,7 +156,8 @@ cdef double fun_and_grad_nogil(
 
 
 cdef double fun_and_grad_linear_reg_nogil(
-    const double* X,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y,
     const double* sample_weight,
     double* w,
@@ -158,12 +168,11 @@ cdef double fun_and_grad_linear_reg_nogil(
     double* weighted_residuals,
     double* grad_w) noexcept nogil:
 
-    cdef Py_ssize_t i, lda = N
+    cdef Py_ssize_t i
     cdef double loss = 0.0
     cdef double residual, sw_scaled
 
-    # pred = X dot w
-    matvec_N(X, w, pred, N, d, lda)
+    matvec_gather_N(X, full_N, row_idx, N, col_idx, d, w, pred)
 
     for i in range(N):
         residual = y[i] - pred[i]
@@ -171,8 +180,7 @@ cdef double fun_and_grad_linear_reg_nogil(
         weighted_residuals[i] = residual * sw_scaled
         loss += 0.5 * sw_scaled * residual * residual
 
-    # grad = -X^T dot weighted_residuals
-    matvec_T(X, weighted_residuals, grad_w, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, weighted_residuals, grad_w)
     for i in range(d):
         grad_w[i] = -grad_w[i]
 
@@ -180,7 +188,8 @@ cdef double fun_and_grad_linear_reg_nogil(
 
 
 cdef double fun_and_grad_multiclass_nogil(
-    const double* X,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y,
     const double* sample_weight,
     double* w,
@@ -201,7 +210,7 @@ cdef double fun_and_grad_multiclass_nogil(
     double* P_k_L,
     double* P_k_R) noexcept nogil:
 
-    cdef Py_ssize_t i, j, k, lda = N
+    cdef Py_ssize_t i, j, k
     cdef double S_L = 0.0, S_R = 0.0
     cdef double impurity_L = 0.0, impurity_R = 0.0
     cdef double loss = 0.0
@@ -210,8 +219,7 @@ cdef double fun_and_grad_multiclass_nogil(
     cdef double tmp_dp, gj, dS_R_w_i
     cdef int yi
 
-    # z = X dot w
-    matvec_N(X, w, z, N, d, lda)
+    matvec_gather_N(X, full_N, row_idx, N, col_idx, d, w, z)
 
     for k in range(n_classes):
         class_counts_L[k] = 0.0
@@ -246,8 +254,7 @@ cdef double fun_and_grad_multiclass_nogil(
 
     loss = S_L * impurity_L + S_R * impurity_R
 
-    # grad_w = X^T dp_dz
-    matvec_T(X, dp_dz, grad_w, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, dp_dz, grad_w)
 
     for i in range(d):
         dS_R_w[i] = -grad_w[i]
@@ -269,7 +276,8 @@ cdef double fun_and_grad_multiclass_nogil(
 
 
 cdef double fun_and_grad_reg_nogil(
-    const double* X,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y,
     const double* sample_weight,
     double* w,
@@ -286,7 +294,7 @@ cdef double fun_and_grad_reg_nogil(
     double* temp_vec2,
     double* temp_grad) noexcept nogil:
 
-    cdef Py_ssize_t i, j, lda = N
+    cdef Py_ssize_t i, j
     cdef double loss = 0.0
     cdef double S_L = 0.0, M_L = 0.0
     cdef double S_R = 0.0, M_R = 0.0
@@ -294,14 +302,12 @@ cdef double fun_and_grad_reg_nogil(
     cdef double p_val, dp_val, sw_i
     cdef double diffL, diffR
     cdef double dS_L_w, dM_L_w, d_mL_w, d_mR_w
-    cdef double alpha_blas, beta_blas
 
     for i in range(d):
         grad_w[i] = 0.0
         temp_grad[i] = 0.0
 
-    # z = X dot w
-    matvec_N(X, w, z, N, d, lda)
+    matvec_gather_N(X, full_N, row_idx, N, col_idx, d, w, z)
 
     for i in range(N):
         sw_i = sample_weight[i]
@@ -334,18 +340,15 @@ cdef double fun_and_grad_reg_nogil(
 
     loss /= total_weight
 
-    # grad_w = X^T temp_vec1
-    matvec_T(X, temp_vec1, grad_w, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, temp_vec1, grad_w)
 
     for i in range(d):
         temp_grad[i] = 0.0
 
-    # temp_vec2 = dp_dz * sample_weight
     for i in range(N):
         temp_vec2[i] = dp_dz[i] * sample_weight[i]
 
-    # temp_grad = X^T temp_vec2
-    matvec_T(X, temp_vec2, temp_grad, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, temp_vec2, temp_grad)
 
     for j in range(d):
         dS_L_w = temp_grad[j]
@@ -360,10 +363,9 @@ cdef double fun_and_grad_reg_nogil(
                 (1.0 - p[i]) * (y[i] - mR) * d_mR_w
             )
 
-        # grad_w += X^T temp_vec1   (accumulate)
         for i in range(d):
             temp_vec2[i] = 0.0
-        matvec_T(X, temp_vec1, temp_vec2, N, d, lda)
+        matvec_gather_T(X, full_N, row_idx, N, col_idx, d, temp_vec1, temp_vec2)
         for i in range(d):
             grad_w[i] += temp_vec2[i]
 
@@ -375,7 +377,8 @@ cdef double fun_and_grad_reg_nogil(
 
 cdef double fun_and_grad_binary_linear_nogil(
     const double current_class,
-    const double* X,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y,
     const double* sample_weight,
     double* w,
@@ -386,12 +389,11 @@ cdef double fun_and_grad_binary_linear_nogil(
     double* weighted_residuals,
     double* grad_w) noexcept nogil:
 
-    cdef Py_ssize_t i, lda = N
+    cdef Py_ssize_t i
     cdef double loss = 0.0
     cdef double prob, sw_scaled, y_i
 
-    # pred = X dot w
-    matvec_N(X, w, pred, N, d, lda)
+    matvec_gather_N(X, full_N, row_idx, N, col_idx, d, w, pred)
 
     for i in range(N):
         y_i = get_y(y[i], current_class)
@@ -405,21 +407,21 @@ cdef double fun_and_grad_binary_linear_nogil(
 
         weighted_residuals[i] = sw_scaled * (prob - y_i)
 
-    # grad = X^T weighted_residuals
-    matvec_T(X, weighted_residuals, grad_w, N, d, lda)
+    matvec_gather_T(X, full_N, row_idx, N, col_idx, d, weighted_residuals, grad_w)
 
     return loss
 
 
 # ---------------------------------------------------------------------------
-# Unified loss/grad dispatcher  (calls the right function based on params)
+# Unified loss/grad dispatcher
 # ---------------------------------------------------------------------------
 cdef double eval_loss_grad(
     const bint task_,
     const int n_classes,
     const double current_class,
     const bint linear,
-    const double* X,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y,
     const double* sample_weight,
     double* w,
@@ -433,52 +435,45 @@ cdef double eval_loss_grad(
     double* buf1, double* buf2, double* buf3,
     double* buf4, double* buf5,
     double* buf6, double* buf7) noexcept nogil:
-    """
-    buf layout per task:
-      classification (task_==0):
-        linear:   buf1=pred(N), buf2=weighted_res(N)
-        binary:   buf1=dP_R1_w(d), buf2=dP_L1_w(d), buf3=tmp_y_dp_vec(d),
-                  buf4=dS_R_w(d), buf5=y_dp_vec(N)
-        multiclass: buf1=class_counts_L(nc), buf2=class_counts_R(nc),
-                    buf3=tmp_dp_vec(d), buf4=dS_R_w(d),
-                    buf5=P_k_L(nc), buf6=P_k_R(nc)
-      regression (task_==1):
-        linear:   buf1=pred(N), buf2=weighted_res(N)
-        else:     buf1=temp_vec1(N), buf2=temp_vec2(N), buf3=temp_grad(d)
-    """
+
     if task_ == 0:
         if linear:
             return fun_and_grad_binary_linear_nogil(
-                current_class, X, y, sample_weight, w,
+                current_class, X, full_N, row_idx, col_idx,
+                y, sample_weight, w,
                 N, d, total_weight, buf1, buf2, grad_w)
         else:
             if n_classes > 2:
                 return fun_and_grad_multiclass_nogil(
-                    X, y, sample_weight, w,
+                    X, full_N, row_idx, col_idx,
+                    y, sample_weight, w,
                     N, d, n_classes, gamma, eps, total_weight,
                     buf_z, buf_p, buf_dp_dz, grad_w,
                     buf1, buf2, buf3, buf4, buf5, buf6)
             else:
                 return fun_and_grad_nogil(
-                    X, y, sample_weight, w,
+                    X, full_N, row_idx, col_idx,
+                    y, sample_weight, w,
                     N, d, gamma, eps, total_weight,
                     buf_z, buf_p, buf_dp_dz, grad_w,
                     buf1, buf2, buf3, buf4, buf5)
     else:
         if linear:
             return fun_and_grad_linear_reg_nogil(
-                X, y, sample_weight, w,
+                X, full_N, row_idx, col_idx,
+                y, sample_weight, w,
                 N, d, total_weight, buf1, buf2, grad_w)
         else:
             return fun_and_grad_reg_nogil(
-                X, y, sample_weight, w,
+                X, full_N, row_idx, col_idx,
+                y, sample_weight, w,
                 N, d, gamma, eps, total_weight,
                 buf_z, buf_p, buf_dp_dz, grad_w,
                 buf1, buf2, buf3)
 
 
 # ---------------------------------------------------------------------------
-# Pure Cython L-BFGS 
+# Pure Cython L-BFGS  (nogil, no scipy)
 # ---------------------------------------------------------------------------
 cdef inline double dot(const double* a, const double* b,
                        Py_ssize_t n) noexcept nogil:
@@ -499,62 +494,53 @@ cdef inline double inf_norm(const double* a, Py_ssize_t n) noexcept nogil:
 
 
 cdef double lbfgs_minimize_nogil(
-    # problem selectors
     const bint task_,
     const int n_classes,
     const double current_class,
     const bint linear,
-    # params  (modified in place)
-    double* x,           # (d,)
-    # data
-    const double* X_data,
+    double* x,
+    const double* X_data, Py_ssize_t full_N,
+    const int* row_idx, const int* col_idx,
     const double* y_data,
     const double* sample_weight,
     const double total_weight,
     const Py_ssize_t N,
     const Py_ssize_t d,
-    # hyperparams
     const double gamma,
     const double eps,
-    const int m,          # history size
+    const int m,
     const int maxiter,
     const double relative_change,
     const double pgtol,
     const int maxls,
-    # workspaces  (all pre-allocated per-thread)
-    double* grad,         # (d,)
-    double* grad_new,     # (d,)
-    double* direction,    # (d,)
-    double* x_new,        # (d,)
-    double* s_hist,       # (m*d,)
-    double* y_hist,       # (m*d,)
-    double* rho,          # (m,)
-    double* alpha_buf,    # (m,)
-    # scratch buffers for loss/grad
-    double* buf_z,        # (N,)
-    double* buf_p,        # (N,)
-    double* buf_dp_dz,    # (N,)
+    double* grad,
+    double* grad_new,
+    double* direction,
+    double* x_new,
+    double* s_hist,
+    double* y_hist,
+    double* rho,
+    double* alpha_buf,
+    double* buf_z,
+    double* buf_p,
+    double* buf_dp_dz,
     double* buf1, double* buf2, double* buf3,
     double* buf4, double* buf5,
     double* buf6, double* buf7,
 ) noexcept nogil:
-    """
-    L-BFGS minimizer — fully nogil.
-    Returns the final objective value.  x is modified in-place.
-    """
     cdef Py_ssize_t i, j, k, idx
-    cdef int n_stored = 0          # how many (s,y) pairs we have
-    cdef int head = 0              # ring-buffer insertion point
+    cdef int n_stored = 0
+    cdef int head = 0
     cdef double f_val, f_new, f_old
     cdef double step, dg, ys, yy, beta_val, gamma_k
     cdef double c1 = 1e-4
     cdef int ls
     cdef bint ls_ok
 
-    # Initial function + gradient
     f_val = eval_loss_grad(
         task_, n_classes, current_class, linear,
-        X_data, y_data, sample_weight, x,
+        X_data, full_N, row_idx, col_idx,
+        y_data, sample_weight, x,
         N, d, gamma, eps, total_weight,
         grad,
         buf_z, buf_p, buf_dp_dz,
@@ -566,12 +552,10 @@ cdef double lbfgs_minimize_nogil(
     f_old = INFINITY
 
     for k in range(maxiter):
-        # --- Two-loop recursion to get search direction ---
-        # q = -grad
+        # Two-loop recursion
         for i in range(d):
             direction[i] = -grad[i]
 
-        # backward pass
         j = (head - 1 + m) % m
         for i in range(n_stored):
             alpha_buf[j] = rho[j] * dot(&s_hist[j * d], direction, d)
@@ -579,7 +563,6 @@ cdef double lbfgs_minimize_nogil(
                 direction[idx] -= alpha_buf[j] * y_hist[j * d + idx]
             j = (j - 1 + m) % m
 
-        # scale by gamma_k = s^T y / y^T y
         if n_stored > 0:
             j = (head - 1 + m) % m
             yy = dot(&y_hist[j * d], &y_hist[j * d], d)
@@ -590,7 +573,6 @@ cdef double lbfgs_minimize_nogil(
             for i in range(d):
                 direction[i] *= gamma_k
 
-        # forward pass
         j = (head - n_stored + m) % m
         for i in range(n_stored):
             beta_val = rho[j] * dot(&y_hist[j * d], direction, d)
@@ -598,10 +580,9 @@ cdef double lbfgs_minimize_nogil(
                 direction[idx] += (alpha_buf[j] - beta_val) * s_hist[j * d + idx]
             j = (j + 1) % m
 
-        # --- Backtracking line search (Armijo) ---
+        # Backtracking line search (Armijo)
         dg = dot(grad, direction, d)
         if dg >= 0:
-            # Not a descent direction – fall back to steepest descent
             for i in range(d):
                 direction[i] = -grad[i]
             dg = dot(grad, direction, d)
@@ -614,7 +595,8 @@ cdef double lbfgs_minimize_nogil(
 
             f_new = eval_loss_grad(
                 task_, n_classes, current_class, linear,
-                X_data, y_data, sample_weight, x_new,
+                X_data, full_N, row_idx, col_idx,
+                y_data, sample_weight, x_new,
                 N, d, gamma, eps, total_weight,
                 grad_new,
                 buf_z, buf_p, buf_dp_dz,
@@ -626,12 +608,11 @@ cdef double lbfgs_minimize_nogil(
             step *= 0.5
 
         if not ls_ok:
-            # Line search failed — reject step, restart with steepest descent
             n_stored = 0
             head = 0
             continue
 
-        # --- Update history ---
+        # Update history
         ys = 0.0
         for i in range(d):
             s_hist[head * d + i] = x_new[i] - x[i]
@@ -644,14 +625,12 @@ cdef double lbfgs_minimize_nogil(
             if n_stored < m:
                 n_stored += 1
 
-        # Accept step
         for i in range(d):
             x[i] = x_new[i]
             grad[i] = grad_new[i]
 
         f_val = f_new
 
-        # Convergence checks
         if inf_norm(grad, d) < pgtol:
             break
         if f_old != INFINITY and f_old > 0:
@@ -684,18 +663,15 @@ cdef struct ThreadWorkspace:
     double* buf5
     double* buf6
     double* buf7
-    double* x_work    # working copy of x0
-    double* X_pair    # per-thread gather buffer (N * d)
+    double* x_work
 
 
 cdef bint _check_ws(ThreadWorkspace* w, bint task_, bint linear,
                     int n_classes) noexcept nogil:
-    """Return True if all required pointers are non-NULL."""
     if (w.grad == NULL or w.grad_new == NULL or w.direction == NULL or
         w.x_new == NULL or w.s_hist == NULL or w.y_hist == NULL or
         w.rho == NULL or w.alpha_buf == NULL or w.x_work == NULL or
-        w.X_pair == NULL or w.buf_z == NULL or w.buf_p == NULL or
-        w.buf_dp_dz == NULL):
+        w.buf_z == NULL or w.buf_p == NULL or w.buf_dp_dz == NULL):
         return False
     if task_ == 0:
         if linear:
@@ -716,13 +692,11 @@ cdef bint _check_ws(ThreadWorkspace* w, bint task_, bint linear,
 cdef ThreadWorkspace* alloc_workspaces(
     int n_threads, Py_ssize_t N, Py_ssize_t d,
     int lbfgs_m, int n_classes, bint task_, bint linear) noexcept:
-    """Allocate workspace for each thread. Returns NULL on failure."""
     cdef ThreadWorkspace* ws = <ThreadWorkspace*>calloc(
         n_threads, sizeof(ThreadWorkspace))
     if ws == NULL:
         return NULL
     cdef int t
-    cdef Py_ssize_t buf_n  # size for N-sized buffers based on task
 
     for t in range(n_threads):
         ws[t].grad      = <double*>malloc(d * sizeof(double))
@@ -734,51 +708,49 @@ cdef ThreadWorkspace* alloc_workspaces(
         ws[t].rho       = <double*>calloc(lbfgs_m, sizeof(double))
         ws[t].alpha_buf = <double*>malloc(lbfgs_m * sizeof(double))
         ws[t].x_work    = <double*>malloc(d * sizeof(double))
-        ws[t].X_pair    = <double*>malloc(N * d * sizeof(double))
 
         ws[t].buf_z     = <double*>malloc(N * sizeof(double))
         ws[t].buf_p     = <double*>malloc(N * sizeof(double))
         ws[t].buf_dp_dz = <double*>malloc(N * sizeof(double))
 
-        # Task-dependent buffers
         if task_ == 0:
             if linear:
-                ws[t].buf1 = <double*>malloc(N * sizeof(double))  # pred
-                ws[t].buf2 = <double*>malloc(N * sizeof(double))  # weighted_res
+                ws[t].buf1 = <double*>malloc(N * sizeof(double))
+                ws[t].buf2 = <double*>malloc(N * sizeof(double))
                 ws[t].buf3 = NULL
                 ws[t].buf4 = NULL
                 ws[t].buf5 = NULL
                 ws[t].buf6 = NULL
                 ws[t].buf7 = NULL
             elif n_classes > 2:
-                ws[t].buf1 = <double*>malloc(n_classes * sizeof(double))  # class_counts_L
-                ws[t].buf2 = <double*>malloc(n_classes * sizeof(double))  # class_counts_R
-                ws[t].buf3 = <double*>malloc(d * sizeof(double))          # tmp_dp_vec
-                ws[t].buf4 = <double*>malloc(d * sizeof(double))          # dS_R_w
-                ws[t].buf5 = <double*>calloc(n_classes, sizeof(double))   # P_k_L
-                ws[t].buf6 = <double*>calloc(n_classes, sizeof(double))   # P_k_R
+                ws[t].buf1 = <double*>malloc(n_classes * sizeof(double))
+                ws[t].buf2 = <double*>malloc(n_classes * sizeof(double))
+                ws[t].buf3 = <double*>malloc(d * sizeof(double))
+                ws[t].buf4 = <double*>malloc(d * sizeof(double))
+                ws[t].buf5 = <double*>calloc(n_classes, sizeof(double))
+                ws[t].buf6 = <double*>calloc(n_classes, sizeof(double))
                 ws[t].buf7 = NULL
             else:
-                ws[t].buf1 = <double*>malloc(d * sizeof(double))  # dP_R1_w
-                ws[t].buf2 = <double*>malloc(d * sizeof(double))  # dP_L1_w
-                ws[t].buf3 = <double*>malloc(d * sizeof(double))  # tmp_y_dp_vec
-                ws[t].buf4 = <double*>malloc(d * sizeof(double))  # dS_R_w
-                ws[t].buf5 = <double*>malloc(N * sizeof(double))  # y_dp_vec
+                ws[t].buf1 = <double*>malloc(d * sizeof(double))
+                ws[t].buf2 = <double*>malloc(d * sizeof(double))
+                ws[t].buf3 = <double*>malloc(d * sizeof(double))
+                ws[t].buf4 = <double*>malloc(d * sizeof(double))
+                ws[t].buf5 = <double*>malloc(N * sizeof(double))
                 ws[t].buf6 = NULL
                 ws[t].buf7 = NULL
         else:
             if linear:
-                ws[t].buf1 = <double*>malloc(N * sizeof(double))  # pred
-                ws[t].buf2 = <double*>malloc(N * sizeof(double))  # weighted_res
+                ws[t].buf1 = <double*>malloc(N * sizeof(double))
+                ws[t].buf2 = <double*>malloc(N * sizeof(double))
                 ws[t].buf3 = NULL
                 ws[t].buf4 = NULL
                 ws[t].buf5 = NULL
                 ws[t].buf6 = NULL
                 ws[t].buf7 = NULL
             else:
-                ws[t].buf1 = <double*>malloc(N * sizeof(double))  # temp_vec1
-                ws[t].buf2 = <double*>malloc(N * sizeof(double))  # temp_vec2
-                ws[t].buf3 = <double*>malloc(d * sizeof(double))  # temp_grad
+                ws[t].buf1 = <double*>malloc(N * sizeof(double))
+                ws[t].buf2 = <double*>malloc(N * sizeof(double))
+                ws[t].buf3 = <double*>malloc(d * sizeof(double))
                 ws[t].buf4 = NULL
                 ws[t].buf5 = NULL
                 ws[t].buf6 = NULL
@@ -803,7 +775,6 @@ cdef void free_workspaces(ThreadWorkspace* ws, int n_threads) noexcept:
         free(ws[t].rho)
         free(ws[t].alpha_buf)
         free(ws[t].x_work)
-        free(ws[t].X_pair)
         free(ws[t].buf_z)
         free(ws[t].buf_p)
         free(ws[t].buf_dp_dz)
@@ -815,6 +786,38 @@ cdef void free_workspaces(ThreadWorkspace* ws, int n_threads) noexcept:
         free(ws[t].buf6)
         free(ws[t].buf7)
     free(ws)
+
+
+# ---------------------------------------------------------------------------
+# C-level pair generation  (no Python combinations)
+# ---------------------------------------------------------------------------
+cdef Py_ssize_t count_pairs(Py_ssize_t n, int n_pair) noexcept nogil:
+    """C(n, n_pair) for n_pair = 2 or 3."""
+    if n_pair == 2:
+        return n * (n - 1) // 2
+    elif n_pair == 3:
+        return n * (n - 1) * (n - 2) // 6
+    return 0
+
+cdef void generate_pairs_2(const int* features, Py_ssize_t n_feat,
+                           int* out) noexcept nogil:
+    cdef Py_ssize_t idx = 0, i, j
+    for i in range(n_feat):
+        for j in range(i + 1, n_feat):
+            out[idx * 2]     = features[i]
+            out[idx * 2 + 1] = features[j]
+            idx += 1
+
+cdef void generate_pairs_3(const int* features, Py_ssize_t n_feat,
+                           int* out) noexcept nogil:
+    cdef Py_ssize_t idx = 0, i, j, k
+    for i in range(n_feat):
+        for j in range(i + 1, n_feat):
+            for k in range(j + 1, n_feat):
+                out[idx * 3]     = features[i]
+                out[idx * 3 + 1] = features[j]
+                out[idx * 3 + 2] = features[k]
+                idx += 1
 
 
 # ---------------------------------------------------------------------------
@@ -838,85 +841,96 @@ cdef tuple[double*, int*] analyze(
                 const double relative_change,
               ) noexcept:
 
+    # --- Subsample y and sample_weight (small); keep X global ---
     cdef np.ndarray[int, ndim=1] sample_dx = np.frombuffer(
         <bytes>(<char*>sample_indices)[:n_samples * sizeof(int)], dtype=np.int32)
-    X = X[sample_dx, :].copy(order="F")
-    y = y[sample_dx].copy()
-    sample_weight = sample_weight[sample_dx].copy()
+    cdef np.ndarray[double, ndim=1] y_sub = y[sample_dx].copy()
+    cdef np.ndarray[double, ndim=1] sw_sub = sample_weight[sample_dx].copy()
 
-    cdef double sum_sample_weight = sample_weight.sum()
-    cdef Py_ssize_t N = X.shape[0], d = X.shape[1], i
-    cdef list feature_range
-    cdef list feature_pairs
+    cdef double sum_sample_weight = sw_sub.sum()
+    cdef Py_ssize_t N = n_samples
+    cdef Py_ssize_t d = X.shape[1]
+    cdef Py_ssize_t full_N = X.shape[0]
+    cdef Py_ssize_t i
 
     cdef int* best_pair = NULL
     cdef double* best_x = NULL
-
     cdef double best_fx = INFINITY
 
-    if is_categorical:
-        feature_range = [i for i in list(range(d)) if not is_categorical[i]]
-        if len(feature_range) == 0:
-            return best_x, best_pair
-        feature_pairs = list(combinations(feature_range, n_pair))
-    else:
-        feature_pairs = list(combinations(range(d), n_pair))
+    # --- Build usable-feature list in C ---
+    cdef int* usable_features = <int*>malloc(d * sizeof(int))
+    if usable_features == NULL:
+        return NULL, NULL
+    cdef Py_ssize_t n_usable = 0
 
-    cdef Py_ssize_t n_feature_pairs = len(feature_pairs)
-    if n_feature_pairs == 0:
+    if is_categorical:
+        for i in range(d):
+            if not is_categorical[i]:
+                usable_features[n_usable] = <int>i
+                n_usable += 1
+    else:
+        for i in range(d):
+            usable_features[i] = <int>i
+        n_usable = d
+
+    if n_usable < n_pair:
+        free(usable_features)
         return best_x, best_pair
+
+    cdef Py_ssize_t n_feature_pairs = count_pairs(n_usable, n_pair)
+    if n_feature_pairs == 0:
+        free(usable_features)
+        return best_x, best_pair
+
+    # --- Generate pair indices in C ---
+    cdef int* pair_indices = <int*>malloc(n_feature_pairs * n_pair * sizeof(int))
+    if pair_indices == NULL:
+        free(usable_features)
+        return NULL, NULL
+
+    if n_pair == 2:
+        generate_pairs_2(usable_features, n_usable, pair_indices)
+    elif n_pair == 3:
+        generate_pairs_3(usable_features, n_usable, pair_indices)
+    free(usable_features)
 
     best_pair = <int*>malloc(n_pair * sizeof(int))
     best_x = <double*>malloc(n_pair * sizeof(double))
     if best_pair == NULL or best_x == NULL:
         free(best_pair)
         free(best_x)
+        free(pair_indices)
         return NULL, NULL
 
-    # multi_range: only linear (binary_linear) path needs per-class iteration.
-    # Nonlinear multiclass loss already handles all classes internally.
-    cdef int multi_range = 1
-    if linear and n_classes > 2:
-        multi_range = n_classes
-    cdef Py_ssize_t total_jobs = n_feature_pairs * multi_range
-
-    # --- Build flat pair-index array for nogil access ---
-    cdef int* pair_indices = <int*>malloc(n_feature_pairs * n_pair * sizeof(int))
-    cdef Py_ssize_t pi, fi
-    for pi in range(n_feature_pairs):
-        pair = feature_pairs[pi]
-        for fi in range(n_pair):
-            pair_indices[pi * n_pair + fi] = pair[fi]
+    # --- Ensure X is Fortran-order for gathered access ---
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    cdef double* X_ptr = <double*>np.PyArray_DATA(X)
 
     # --- Pre-generate all random x0 values ---
     cdef np.ndarray[double, ndim=2] all_x0 = rng.standard_normal(
         (n_feature_pairs, n_pair)).astype(np.float64)
     cdef double* all_x0_ptr = <double*>np.PyArray_DATA(all_x0)
 
-    # --- Raw pointers to data (Fortran-order X, contiguous y / sw) ---
-    cdef double* X_ptr = <double*>np.PyArray_DATA(X)
-    cdef Py_ssize_t X_lda = N   # Fortran col-major stride
-    cdef double* y_ptr = <double*>np.PyArray_DATA(y)
-    cdef double* sw_ptr = <double*>np.PyArray_DATA(sample_weight)
+    cdef double* y_ptr = <double*>np.PyArray_DATA(y_sub)
+    cdef double* sw_ptr = <double*>np.PyArray_DATA(sw_sub)
 
-    # --- Allocate per-thread workspaces (includes X_pair scratch) ---
+    # --- Allocate per-thread workspaces ---
     cdef int n_threads = openmp.omp_get_max_threads()
     cdef int lbfgs_m = 10
     cdef ThreadWorkspace* workspaces = alloc_workspaces(
         n_threads, N, n_pair, lbfgs_m, n_classes, task, linear)
 
-    if workspaces == NULL or pair_indices == NULL:
+    if workspaces == NULL:
         free(pair_indices)
         free(best_pair)
         free(best_x)
-        if workspaces != NULL:
-            free_workspaces(workspaces, n_threads)
         return NULL, NULL
 
     # --- Results arrays ---
-    cdef double* pair_losses = <double*>malloc(total_jobs * sizeof(double))
+    cdef double* pair_losses = <double*>malloc(n_feature_pairs * sizeof(double))
     cdef double* pair_weights = <double*>malloc(
-        total_jobs * n_pair * sizeof(double))
+        n_feature_pairs * n_pair * sizeof(double))
 
     if pair_losses == NULL or pair_weights == NULL:
         free(pair_indices)
@@ -927,63 +941,60 @@ cdef tuple[double*, int*] analyze(
         free_workspaces(workspaces, n_threads)
         return NULL, NULL
 
-    for i in range(total_jobs):
+    for i in range(n_feature_pairs):
         pair_losses[i] = INFINITY
 
     # --- Parallel feature-pair optimization ---
-    cdef Py_ssize_t job_idx, pair_idx, class_idx, col
-    cdef int tid
+    # Linear multiclass: class loop runs inside per-pair, so pair columns
+    # are gathered once and warm-start carries across classes.
+    cdef Py_ssize_t pair_idx
+    cdef int tid, ci
     cdef double f_val
     cdef ThreadWorkspace* w
+    cdef int multi_range = 1
+    if linear and n_classes > 2:
+        multi_range = n_classes
 
-    for job_idx in prange(total_jobs, nogil=True, schedule="dynamic"):
+    for pair_idx in prange(n_feature_pairs, nogil=True, schedule="dynamic"):
         tid = openmp.omp_get_thread_num()
         w = &workspaces[tid]
-        pair_idx = job_idx // multi_range
-        class_idx = job_idx % multi_range
 
-        # Gather columns for this pair into thread-local X_pair (Fortran order)
-        for fi in range(n_pair):
-            col = pair_indices[pair_idx * n_pair + fi]
-            memcpy(&w.X_pair[fi * N],
-                   &X_ptr[col * X_lda],
-                   N * sizeof(double))
-
-        # Copy x0 into working buffer
+        # Copy x0
         memcpy(w.x_work, &all_x0_ptr[pair_idx * n_pair],
                n_pair * sizeof(double))
 
-        # Clear L-BFGS history
-        memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
-        memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
-        memset(w.rho, 0, lbfgs_m * sizeof(double))
+        # Run optimization — class loop inside for warm-start
+        f_val = INFINITY
+        for ci in range(multi_range):
+            memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
+            memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
+            memset(w.rho, 0, lbfgs_m * sizeof(double))
 
-        f_val = lbfgs_minimize_nogil(
-            task, n_classes, <double>class_idx, linear,
-            w.x_work,
-            w.X_pair, y_ptr, sw_ptr, sum_sample_weight,
-            N, n_pair,
-            gamma, 1e-6, lbfgs_m, maxiter, relative_change,
-            1e-5, 20,
-            w.grad, w.grad_new, w.direction, w.x_new,
-            w.s_hist, w.y_hist, w.rho, w.alpha_buf,
-            w.buf_z, w.buf_p, w.buf_dp_dz,
-            w.buf1, w.buf2, w.buf3,
-            w.buf4, w.buf5, w.buf6, w.buf7)
+            f_val = lbfgs_minimize_nogil(
+                task, n_classes, <double>ci, linear,
+                w.x_work,
+                X_ptr, full_N,
+                sample_indices, &pair_indices[pair_idx * n_pair],
+                y_ptr, sw_ptr, sum_sample_weight,
+                N, n_pair,
+                gamma, 1e-6, lbfgs_m, maxiter, relative_change,
+                1e-5, 20,
+                w.grad, w.grad_new, w.direction, w.x_new,
+                w.s_hist, w.y_hist, w.rho, w.alpha_buf,
+                w.buf_z, w.buf_p, w.buf_dp_dz,
+                w.buf1, w.buf2, w.buf3,
+                w.buf4, w.buf5, w.buf6, w.buf7)
 
-        pair_losses[job_idx] = f_val
-        memcpy(&pair_weights[job_idx * n_pair], w.x_work,
+        pair_losses[pair_idx] = f_val
+        memcpy(&pair_weights[pair_idx * n_pair], w.x_work,
                n_pair * sizeof(double))
 
-    # --- Find best result (sequential) ---
+    # --- Find best result ---
     cdef Py_ssize_t best_job = 0
-    for i in range(total_jobs):
+    for i in range(n_feature_pairs):
         if pair_losses[i] < best_fx:
             best_fx = pair_losses[i]
             best_job = i
-
-    cdef Py_ssize_t best_pair_idx = best_job // multi_range
-    cdef tuple best_pair_py = feature_pairs[best_pair_idx]
 
     # Normalize weights
     cdef double max_abs = 0.0
@@ -994,20 +1005,19 @@ cdef tuple[double*, int*] analyze(
         max_abs = 1.0
 
     for i in range(n_pair):
-        best_pair[i] = best_pair_py[i]
+        best_pair[i] = pair_indices[best_job * n_pair + i]
         best_x[i] = pair_weights[best_job * n_pair + i] / max_abs
 
-    # Compute best_values and sort
-    cdef np.ndarray[double, ndim=1] best_x_np = np.empty(n_pair, dtype=np.float64)
-    for i in range(n_pair):
-        best_x_np[i] = best_x[i]
-    cdef double[::1] best_values = np.dot(X[:, best_pair_py], best_x_np)
-
+    # Compute best_values and sort  (use gathered dot on global X)
+    cdef double bv
     with nogil:
-        for i in range(n_samples):
-            sort_buffer[i].value = best_values[i]
+        for i in range(N):
+            bv = 0.0
+            for ci in range(n_pair):
+                bv += X_ptr[sample_indices[i] + <Py_ssize_t>best_pair[ci] * full_N] * best_x[ci]
+            sort_buffer[i].value = bv
             sort_buffer[i].index = sample_indices[i]
-        sort_pointer_array(sort_buffer, n_samples)
+        sort_pointer_array(sort_buffer, N)
 
     # Cleanup
     free(pair_indices)
