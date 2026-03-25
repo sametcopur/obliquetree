@@ -21,43 +21,94 @@ cdef inline double sigmoid(const double x) noexcept nogil:
     return 1.0 / (1.0 + exp(-x))
 
 # ---------------------------------------------------------------------------
-# Contiguous mat-vec for small d  (Fortran col-major, lda = N)
+# Contiguous mat-vec  (Fortran col-major, lda = N)
+# Unrolled for d=2/3, generic fallback otherwise.
 # ---------------------------------------------------------------------------
 cdef inline void matvec_N(const double* X, const double* w,
                           double* out, Py_ssize_t N, Py_ssize_t d,
                           Py_ssize_t lda) noexcept nogil:
-    """out[i] = sum_j X[i + j*lda] * w[j]"""
     cdef Py_ssize_t i, j
-    for i in range(N):
-        out[i] = 0.0
-    for j in range(d):
+    cdef double w0, w1, w2
+    cdef const double* c0
+    cdef const double* c1
+    cdef const double* c2
+    if d == 2:
+        w0 = w[0]; w1 = w[1]
+        c0 = X; c1 = X + lda
         for i in range(N):
-            out[i] += X[i + j * lda] * w[j]
+            out[i] = c0[i] * w0 + c1[i] * w1
+    elif d == 3:
+        w0 = w[0]; w1 = w[1]; w2 = w[2]
+        c0 = X; c1 = X + lda; c2 = X + 2 * lda
+        for i in range(N):
+            out[i] = c0[i] * w0 + c1[i] * w1 + c2[i] * w2
+    else:
+        for i in range(N):
+            out[i] = 0.0
+        for j in range(d):
+            for i in range(N):
+                out[i] += X[i + j * lda] * w[j]
 
 cdef inline void matvec_T(const double* X, const double* v,
                           double* out, Py_ssize_t N, Py_ssize_t d,
                           Py_ssize_t lda) noexcept nogil:
-    """out[j] = sum_i X[i + j*lda] * v[i]"""
     cdef Py_ssize_t i, j
-    for j in range(d):
-        out[j] = 0.0
+    cdef double s0, s1, s2
+    cdef const double* c0
+    cdef const double* c1
+    cdef const double* c2
+    if d == 2:
+        s0 = 0.0; s1 = 0.0
+        c0 = X; c1 = X + lda
         for i in range(N):
-            out[j] += X[i + j * lda] * v[i]
+            s0 += c0[i] * v[i]
+            s1 += c1[i] * v[i]
+        out[0] = s0; out[1] = s1
+    elif d == 3:
+        s0 = 0.0; s1 = 0.0; s2 = 0.0
+        c0 = X; c1 = X + lda; c2 = X + 2 * lda
+        for i in range(N):
+            s0 += c0[i] * v[i]
+            s1 += c1[i] * v[i]
+            s2 += c2[i] * v[i]
+        out[0] = s0; out[1] = s1; out[2] = s2
+    else:
+        for j in range(d):
+            out[j] = 0.0
+            for i in range(N):
+                out[j] += X[i + j * lda] * v[i]
 
 # ---------------------------------------------------------------------------
-# Gather: fill contiguous X_pair (N x n_pair, Fortran) from global X
+# Gather: fill contiguous X_pair from global X.  Unrolled for d=2/3.
 # ---------------------------------------------------------------------------
 cdef inline void gather_X_pair(
-    const double* X_global, Py_ssize_t full_N,   # original X, Fortran
-    const int* row_idx, Py_ssize_t N,             # sample_indices
-    const int* col_idx, Py_ssize_t d,             # pair column indices
-    double* X_pair,                               # output: (N x d) Fortran
+    const double* X_global, Py_ssize_t full_N,
+    const int* row_idx, Py_ssize_t N,
+    const int* col_idx, Py_ssize_t d,
+    double* X_pair,
 ) noexcept nogil:
-    """Copy selected rows+cols from global X into contiguous X_pair."""
     cdef Py_ssize_t i, j
-    for j in range(d):
+    cdef const double* src0
+    cdef const double* src1
+    cdef const double* src2
+    if d == 2:
+        src0 = X_global + <Py_ssize_t>col_idx[0] * full_N
+        src1 = X_global + <Py_ssize_t>col_idx[1] * full_N
         for i in range(N):
-            X_pair[i + j * N] = X_global[row_idx[i] + <Py_ssize_t>col_idx[j] * full_N]
+            X_pair[i]     = src0[row_idx[i]]
+            X_pair[i + N] = src1[row_idx[i]]
+    elif d == 3:
+        src0 = X_global + <Py_ssize_t>col_idx[0] * full_N
+        src1 = X_global + <Py_ssize_t>col_idx[1] * full_N
+        src2 = X_global + <Py_ssize_t>col_idx[2] * full_N
+        for i in range(N):
+            X_pair[i]         = src0[row_idx[i]]
+            X_pair[i + N]     = src1[row_idx[i]]
+            X_pair[i + 2 * N] = src2[row_idx[i]]
+    else:
+        for j in range(d):
+            for i in range(N):
+                X_pair[i + j * N] = X_global[row_idx[i] + <Py_ssize_t>col_idx[j] * full_N]
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +391,10 @@ cdef double eval_loss_grad(
 # ---------------------------------------------------------------------------
 cdef inline double dot(const double* a, const double* b,
                        Py_ssize_t n) noexcept nogil:
+    if n == 2:
+        return a[0] * b[0] + a[1] * b[1]
+    elif n == 3:
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
     cdef Py_ssize_t i
     cdef double s = 0.0
     for i in range(n):
@@ -349,6 +404,17 @@ cdef inline double dot(const double* a, const double* b,
 cdef inline double inf_norm(const double* a, Py_ssize_t n) noexcept nogil:
     cdef Py_ssize_t i
     cdef double mx = 0.0, v
+    if n == 2:
+        mx = fabs(a[0])
+        v = fabs(a[1])
+        return mx if mx >= v else v
+    elif n == 3:
+        mx = fabs(a[0])
+        v = fabs(a[1])
+        if v > mx: mx = v
+        v = fabs(a[2])
+        if v > mx: mx = v
+        return mx
     for i in range(n):
         v = fabs(a[i])
         if v > mx:
