@@ -363,9 +363,11 @@ class BaseTree(TreeClassifier):
                     "sample_weight cannot contain negative, NaN or inf values"
                 )
 
-            min_val = np.min(sample_weight)
-            if min_val != 1:
-                sample_weight = sample_weight / min_val
+            positive_mask = sample_weight > 0
+            if positive_mask.any():
+                min_val = np.min(sample_weight[positive_mask])
+                if min_val != 1:
+                    sample_weight = sample_weight / min_val
 
         else:
             sample_weight = np.ones(n_samples, dtype=np.float64)
