@@ -5,16 +5,23 @@ on:
 
 jobs:
   build_wheels:
-    name: Build wheels on ${{ matrix.os }}
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os:
-          [
-            ubuntu-latest,
-            windows-latest,
-            macos-latest,
-          ]
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+            cibw_archs: x86_64
+          - os: windows-latest
+            arch: x86_64
+            cibw_archs: AMD64
+          - os: macos-15
+            arch: arm64
+            cibw_archs: arm64
+          - os: macos-15-large
+            arch: x86_64
+            cibw_archs: x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +41,7 @@ jobs:
         env:
           CIBW_BUILD: cp310-* cp311-* cp312-* cp313-*
           CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_i686"
+          CIBW_ARCHS: ${{ matrix.cibw_archs }}
           CIBW_BEFORE_BUILD_MACOS: brew install libomp
           CIBW_ENVIRONMENT_MACOS: LIBOMP_PREFIX=$(brew --prefix libomp)
           TWINE_USERNAME: __token__
