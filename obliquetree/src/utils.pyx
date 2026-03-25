@@ -154,6 +154,11 @@ cdef TreeNode* deserialize_tree(dict tree_dict, int n_features, int n_classes) e
     node.categories_go_left = NULL
     node.left = NULL
     node.right = NULL
+    node.node_id = 0
+    node.feature_idx = -1
+    node.threshold = 0.0
+    node.n_pair = 0
+    node.n_category = 0
     
     # Set basic node properties
     node.is_leaf = tree_dict['is_leaf']

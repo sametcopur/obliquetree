@@ -5,6 +5,7 @@ cdef struct TreeNode:
     double value
     double* value_multiclass
     int n_classes
+    int node_id
     int feature_idx
     double threshold
     TreeNode* left
@@ -29,7 +30,6 @@ cdef void predict(
     const TreeNode* node,
     const double[::1, :] X,
     double[:, ::1] out,
-    const int* indices,
     const int n_samples,
     const int n_classes,
 ) noexcept nogil
@@ -66,3 +66,5 @@ cdef TreeNode* build_tree_recursive(
     const double[::1] sample_weight,
     const bint* is_integer,
 )  noexcept nogil
+
+cdef void finalize_tree_metadata(TreeNode* node) noexcept nogil

@@ -2,7 +2,7 @@ from cython.parallel cimport prange
 
 from libc.limits cimport INT_MAX, INT_MIN
 from libc.math cimport INFINITY
-from libc.stdlib cimport malloc, free
+from libc.stdlib cimport calloc, malloc, free
 
 from .metric cimport (
     calculate_impurity,
@@ -25,6 +25,24 @@ cdef inline void free_oblique_split(double** x, int** pair) noexcept nogil:
     if pair[0] != NULL:
         free(pair[0])
         pair[0] = NULL
+
+
+cdef int _assign_node_ids(TreeNode* node, int next_node_id) noexcept nogil:
+    if node == NULL:
+        return next_node_id
+
+    node.node_id = next_node_id
+    next_node_id += 1
+
+    if not node.is_leaf:
+        next_node_id = _assign_node_ids(node.left, next_node_id)
+        next_node_id = _assign_node_ids(node.right, next_node_id)
+
+    return next_node_id
+
+
+cdef void finalize_tree_metadata(TreeNode* node) noexcept nogil:
+    _assign_node_ids(node, 0)
 
 
 cdef inline bint should_use_count_sort(
@@ -156,6 +174,8 @@ cdef double evaluate_feature_exact(
     double* out_threshold,
     int* out_left_count,
     bint* out_missing_go_left,
+    int** out_categories_go_left,
+    int* out_n_categories,
     int* out_status,
 ) noexcept nogil:
     cdef SortItem* local_sort_buffer = NULL
@@ -180,6 +200,8 @@ cdef double evaluate_feature_exact(
     out_threshold[0] = 0.0
     out_left_count[0] = 0
     out_missing_go_left[0] = True
+    out_categories_go_left[0] = NULL
+    out_n_categories[0] = 0
 
     local_sort_buffer = <SortItem*>malloc(n_samples * sizeof(SortItem))
     local_nan_indices = <int*>malloc(n_samples * sizeof(int))
@@ -278,6 +300,27 @@ cdef double evaluate_feature_exact(
             task,
         )
 
+        if is_categorical_feature and impurity < INFINITY:
+            out_n_categories[0] = <int>out_threshold[0]
+            if out_n_categories[0] > 0:
+                out_categories_go_left[0] = <int*>malloc(
+                    out_n_categories[0] * sizeof(int)
+                )
+                if out_categories_go_left[0] == NULL:
+                    out_status[0] = 1
+                    if local_count_unique_array != NULL:
+                        free(local_count_unique_array)
+                    if local_count_sort_buffer != NULL:
+                        free(local_count_sort_buffer)
+                    if local_categorical_stats != NULL:
+                        free(local_categorical_stats)
+                    free(local_sort_buffer)
+                    free(local_nan_indices)
+                    return INFINITY
+
+                for i in range(out_n_categories[0]):
+                    out_categories_go_left[0][i] = <int>local_categorical_stats[i].value
+
     if local_count_unique_array != NULL:
         free(local_count_unique_array)
     if local_count_sort_buffer != NULL:
@@ -329,15 +372,14 @@ cdef TreeNode* build_tree_recursive(
     cdef int* best_oblique_pair = NULL
     cdef int* oblique_pair = NULL
     cdef int* linear_pair = NULL
+    cdef int** feature_categories = NULL
+    cdef int* feature_category_counts = NULL
     cdef int* feature_left_counts = NULL
     cdef int* feature_status = NULL
     cdef bint* feature_missing_left = NULL
     cdef int n_features = X.shape[1]
     cdef int f_idx
     cdef int i
-    cdef int idx
-    cdef int n_nans
-    cdef int n_non_nans
     cdef int left_count_c = 0
     cdef int right_count
     cdef int actual_left_count
@@ -346,18 +388,9 @@ cdef TreeNode* build_tree_recursive(
     cdef int best_n_categorical = 0
     cdef bint missing_go_left = True
     cdef bint best_missing_go_left = True
-    cdef bint categorical_is_integer = False
-    cdef bint categorical_has_integer_values = False
     cdef bint use_feature_threads
     cdef double best_threshold = 0.0
-    cdef double x_val
     cdef long long feature_work
-    cdef int categorical_min_value = 0
-    cdef int categorical_max_value = 0
-    cdef int categorical_value_range = 0
-    cdef int categorical_int_value = 0
-    cdef SortItem* local_count_sort_buffer = NULL
-    cdef int* local_count_unique_array = NULL
 
     if node == NULL:
         with gil:
@@ -365,6 +398,7 @@ cdef TreeNode* build_tree_recursive(
 
     node.is_leaf = True
     node.value = 0.0
+    node.node_id = 0
     node.feature_idx = -1
     node.threshold = 0.0
     node.left = NULL
@@ -514,6 +548,8 @@ cdef TreeNode* build_tree_recursive(
 
     feature_thresholds = <double*>malloc(n_features * sizeof(double))
     feature_impurities = <double*>malloc(n_features * sizeof(double))
+    feature_categories = <int**>calloc(n_features, sizeof(int*))
+    feature_category_counts = <int*>calloc(n_features, sizeof(int))
     feature_left_counts = <int*>malloc(n_features * sizeof(int))
     feature_status = <int*>malloc(n_features * sizeof(int))
     feature_missing_left = <bint*>malloc(n_features * sizeof(bint))
@@ -521,12 +557,16 @@ cdef TreeNode* build_tree_recursive(
     if (
         feature_thresholds == NULL or
         feature_impurities == NULL or
+        feature_categories == NULL or
+        feature_category_counts == NULL or
         feature_left_counts == NULL or
         feature_status == NULL or
         feature_missing_left == NULL
     ):
         free(feature_thresholds)
         free(feature_impurities)
+        free(feature_categories)
+        free(feature_category_counts)
         free(feature_left_counts)
         free(feature_status)
         free(feature_missing_left)
@@ -565,13 +605,20 @@ cdef TreeNode* build_tree_recursive(
             &feature_thresholds[f_idx],
             &feature_left_counts[f_idx],
             &feature_missing_left[f_idx],
+            &feature_categories[f_idx],
+            &feature_category_counts[f_idx],
             &feature_status[f_idx],
         )
 
     for f_idx in range(n_features):
         if feature_status[f_idx] != 0:
+            for i in range(n_features):
+                if feature_categories[i] != NULL:
+                    free(feature_categories[i])
             free(feature_thresholds)
             free(feature_impurities)
+            free(feature_categories)
+            free(feature_category_counts)
             free(feature_left_counts)
             free(feature_status)
             free(feature_missing_left)
@@ -585,119 +632,24 @@ cdef TreeNode* build_tree_recursive(
             best_threshold = feature_thresholds[f_idx]
             best_left_count = feature_left_counts[f_idx]
             best_missing_go_left = feature_missing_left[f_idx]
-            best_n_categorical = 0
             free_oblique_split(&best_oblique_x, &best_oblique_pair)
+
+    if best_feature >= 0 and is_categorical[best_feature]:
+        best_n_categorical = feature_category_counts[best_feature]
+        node.categories_go_left = feature_categories[best_feature]
+        feature_categories[best_feature] = NULL
+
+    for f_idx in range(n_features):
+        if feature_categories[f_idx] != NULL:
+            free(feature_categories[f_idx])
 
     free(feature_thresholds)
     free(feature_impurities)
+    free(feature_categories)
+    free(feature_category_counts)
     free(feature_left_counts)
     free(feature_status)
     free(feature_missing_left)
-
-    if best_feature >= 0 and is_categorical[best_feature]:
-        n_nans = 0
-        n_non_nans = 0
-        categorical_is_integer = is_integer[best_feature]
-        categorical_has_integer_values = False
-
-        for i in range(n_samples):
-            idx = sample_indices[i]
-            x_val = X[idx, best_feature]
-
-            if x_val != x_val:
-                nan_indices[n_nans] = idx
-                n_nans += 1
-            else:
-                sort_buffer[n_non_nans].value = x_val
-                sort_buffer[n_non_nans].index = idx
-
-                if categorical_is_integer:
-                    if x_val < INT_MIN or x_val > INT_MAX:
-                        categorical_is_integer = False
-                    else:
-                        categorical_int_value = <int>x_val
-                        if not categorical_has_integer_values:
-                            categorical_min_value = categorical_int_value
-                            categorical_max_value = categorical_int_value
-                            categorical_has_integer_values = True
-                        else:
-                            if categorical_int_value < categorical_min_value:
-                                categorical_min_value = categorical_int_value
-                            elif categorical_int_value > categorical_max_value:
-                                categorical_max_value = categorical_int_value
-
-                n_non_nans += 1
-
-        if n_non_nans >= 2 * min_samples_leaf:
-            if should_use_count_sort(
-                categorical_is_integer and categorical_has_integer_values,
-                n_non_nans,
-                categorical_min_value,
-                categorical_max_value,
-                &categorical_value_range,
-            ):
-                local_count_unique_array = <int*>malloc(categorical_value_range * sizeof(int))
-                local_count_sort_buffer = <SortItem*>malloc(n_non_nans * sizeof(SortItem))
-                if local_count_unique_array == NULL or local_count_sort_buffer == NULL:
-                    if local_count_unique_array != NULL:
-                        free(local_count_unique_array)
-                    if local_count_sort_buffer != NULL:
-                        free(local_count_sort_buffer)
-                    free_oblique_split(&best_oblique_x, &best_oblique_pair)
-                    with gil:
-                        raise MemoryError()
-
-                sort_pointer_array_count(
-                    sort_buffer,
-                    local_count_unique_array,
-                    local_count_sort_buffer,
-                    n_non_nans,
-                    categorical_value_range,
-                    categorical_min_value,
-                )
-            else:
-                sort_pointer_array(sort_buffer, n_non_nans)
-
-            impurity_c = calculate_impurity(
-                True,
-                n_classes,
-                sort_buffer,
-                &sample_weight[0],
-                &y[0],
-                nan_indices,
-                categorical_stats,
-                n_samples,
-                n_nans,
-                min_samples_leaf,
-                &threshold_c,
-                &left_count_c,
-                &missing_go_left,
-                task,
-            )
-
-            if local_count_unique_array != NULL:
-                free(local_count_unique_array)
-                local_count_unique_array = NULL
-            if local_count_sort_buffer != NULL:
-                free(local_count_sort_buffer)
-                local_count_sort_buffer = NULL
-
-            if impurity_c < INFINITY:
-                best_threshold = threshold_c
-                best_left_count = left_count_c
-                best_missing_go_left = missing_go_left
-                best_n_categorical = <int>threshold_c
-                node.n_category = best_n_categorical
-
-                if node.n_category > 0:
-                    node.categories_go_left = <int*>malloc(node.n_category * sizeof(int))
-                    if node.categories_go_left == NULL:
-                        free_oblique_split(&best_oblique_x, &best_oblique_pair)
-                        with gil:
-                            raise MemoryError()
-
-                    for i in range(node.n_category):
-                        node.categories_go_left[i] = <int>categorical_stats[i].value
 
     improvement = node.impurity - min_impurity
     right_count = n_samples - best_left_count
@@ -817,40 +769,31 @@ cdef TreeNode* build_tree_recursive(
     return node
 
 
-cdef void _apply_single(
+cdef inline const TreeNode* _find_leaf(
     const TreeNode* node,
     const double[::1, :] X,
     const int sample_idx,
-    int node_id,
-    int* out,
 ) noexcept nogil:
-    if node.is_leaf:
-        out[0] = node_id
-        return
+    cdef const TreeNode* current = node
 
-    if sample_goes_left(
-        X,
-        sample_idx,
-        node.feature_idx,
-        node.threshold,
-        node.missing_go_left,
-        node.n_pair,
-        node.x,
-        node.pair,
-        node.n_category,
-        node.categories_go_left,
-    ):
-        _apply_single(node.left, X, sample_idx, node_id + 1, out)
-    else:
-        _apply_single(node.right, X, sample_idx, node_id + 1 + _count_nodes(node.left), out)
+    while not current.is_leaf:
+        if sample_goes_left(
+            X,
+            sample_idx,
+            current.feature_idx,
+            current.threshold,
+            current.missing_go_left,
+            current.n_pair,
+            current.x,
+            current.pair,
+            current.n_category,
+            current.categories_go_left,
+        ):
+            current = current.left
+        else:
+            current = current.right
 
-
-cdef int _count_nodes(const TreeNode* node) noexcept nogil:
-    if node == NULL:
-        return 0
-    if node.is_leaf:
-        return 1
-    return 1 + _count_nodes(node.left) + _count_nodes(node.right)
+    return current
 
 
 cdef void apply(
@@ -860,72 +803,27 @@ cdef void apply(
     const int n_samples,
 ) noexcept nogil:
     cdef int i
+    cdef const TreeNode* leaf
     for i in range(n_samples):
-        _apply_single(node, X, i, 0, &out[i])
+        leaf = _find_leaf(node, X, i)
+        out[i] = leaf.node_id
 
 
 cdef void predict(
     const TreeNode* node,
     const double[::1, :] X,
     double[:, ::1] out,
-    const int* indices,
     const int n_samples,
     const int n_classes,
 ) noexcept nogil:
     cdef int i
     cdef int j
-    cdef int idx
-    cdef int left_count = 0
-    cdef int right_count = 0
-    cdef int* left_indices = NULL
-    cdef int* right_indices = NULL
-
-    if node.is_leaf:
-        if n_classes <= 2:
-            for i in range(n_samples):
-                out[indices[i], 0] = node.value
-        else:
-            for i in range(n_samples):
-                idx = indices[i]
-                for j in range(n_classes):
-                    out[idx, j] = node.value_multiclass[j]
-        return
-
-    left_indices = <int*>malloc(n_samples * sizeof(int))
-    right_indices = <int*>malloc(n_samples * sizeof(int))
-
-    if left_indices == NULL or right_indices == NULL:
-        if left_indices != NULL:
-            free(left_indices)
-        if right_indices != NULL:
-            free(right_indices)
-        with gil:
-            raise MemoryError()
+    cdef const TreeNode* leaf
 
     for i in range(n_samples):
-        idx = indices[i]
-        if sample_goes_left(
-            X,
-            idx,
-            node.feature_idx,
-            node.threshold,
-            node.missing_go_left,
-            node.n_pair,
-            node.x,
-            node.pair,
-            node.n_category,
-            node.categories_go_left,
-        ):
-            left_indices[left_count] = idx
-            left_count += 1
+        leaf = _find_leaf(node, X, i)
+        if n_classes <= 2:
+            out[i, 0] = leaf.value
         else:
-            right_indices[right_count] = idx
-            right_count += 1
-
-    if left_count > 0:
-        predict(node.left, X, out, left_indices, left_count, n_classes)
-    if right_count > 0:
-        predict(node.right, X, out, right_indices, right_count, n_classes)
-
-    free(left_indices)
-    free(right_indices)
+            for j in range(n_classes):
+                out[i, j] = leaf.value_multiclass[j]

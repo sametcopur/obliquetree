@@ -2,7 +2,14 @@ from libc.stdlib cimport malloc, free, calloc
 import numpy as np
 cimport numpy as np
 
-from .tree cimport build_tree_recursive, predict, apply, SortItem, CategoryStat
+from .tree cimport (
+    build_tree_recursive,
+    finalize_tree_metadata,
+    predict,
+    apply,
+    SortItem,
+    CategoryStat,
+)
 from .ccp cimport prune_tree
 from .utils cimport analyze_X, export_tree, deserialize_tree
 
@@ -102,6 +109,8 @@ cdef class TreeClassifier:
         self.n_features = params['n_features']
 
         self.root = deserialize_tree(tree, self.n_features, self.n_classes)
+        if self.root != NULL:
+            finalize_tree_metadata(self.root)
 
     cpdef fit(self, double[::1, :] X, double[::1] y, double[::1] sample_weight):
         cdef int n_samples = X.shape[0]
@@ -181,6 +190,9 @@ cdef class TreeClassifier:
             
             if self.ccp_alpha > 0.0:
                 prune_tree(self.root, self.ccp_alpha)
+
+            if self.root != NULL:
+                finalize_tree_metadata(self.root)
                 
         finally:
             free(sort_buffer)
@@ -219,37 +231,26 @@ cdef class TreeClassifier:
         cdef np.ndarray[double, ndim=2] out
         cdef np.ndarray[double, ndim=2] proba 
         cdef int i
-        cdef int* indices = NULL
-    
-        try:
-            if self.root == NULL:
-                raise ValueError("The model has not been fitted yet. Call the 'fit' method before using this model.")
 
-            if self.n_features != n_features:
-                raise ValueError(f"Mismatch in number of features: expected {self.n_features}, but got {n_features}.")
+        if self.root == NULL:
+            raise ValueError("The model has not been fitted yet. Call the 'fit' method before using this model.")
 
-            if self.n_classes > 2:
-                out = np.zeros((n_samples, self.n_classes), dtype=np.float64)
-            else:
-                out = np.zeros((n_samples, 1), dtype=np.float64)
+        if self.n_features != n_features:
+            raise ValueError(f"Mismatch in number of features: expected {self.n_features}, but got {n_features}.")
 
-            indices = <int*>malloc(n_samples * sizeof(int))
-            if not indices:
-                raise MemoryError()
+        if self.n_classes > 2:
+            out = np.zeros((n_samples, self.n_classes), dtype=np.float64)
+        else:
+            out = np.zeros((n_samples, 1), dtype=np.float64)
 
+        predict(self.root, X, out, n_samples, self.n_classes)
+
+        if (self.n_classes <= 2) and (self.task == 0):
+            proba = np.empty((n_samples, self.n_classes), dtype=np.float64)
             for i in range(n_samples):
-                indices[i] = i
+                proba[i, 1] = out[i, 0]           # prob of class 1
+                proba[i, 0] = 1.0 - out[i, 0]     # prob of class 0
 
-            predict(self.root, X, out, indices, n_samples, self.n_classes)
+            return proba
 
-            if (self.n_classes <= 2) and (self.task == 0):
-                proba = np.empty((n_samples, self.n_classes), dtype=np.float64)
-                for i in range(n_samples):
-                    proba[i, 1] = out[i, 0]           # prob of class 1
-                    proba[i, 0] = 1.0 - out[i, 0]     # prob of class 0
-
-                return proba
-            else:
-                return out
-        finally:
-            free(indices)
+        return out

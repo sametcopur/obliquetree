@@ -265,6 +265,26 @@ class BaseTree(TreeClassifier):
             raise ValueError("use_oblique must be a boolean")
         return use_oblique
 
+    def _coerce_feature_matrix(self, X: ArrayLike) -> NDArray:
+        X = np.asarray(X, order="F", dtype=np.float64)
+
+        if X.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D array for input samples, but got an array with {X.ndim} dimensions."
+            )
+
+        return X
+
+    def _prepare_inference_input(self, X: ArrayLike) -> NDArray:
+        if not self._fit:
+            raise ValueError(
+                "The model has not been fitted yet. Please call `fit` first."
+            )
+
+        X = self._coerce_feature_matrix(X)
+        self._validate_categories_in_data(X, is_fit=False)
+        return X
+
     def fit(
         self, X: ArrayLike, y: ArrayLike, sample_weight: Optional[ArrayLike] = None
     ) -> "BaseTree":
@@ -290,13 +310,8 @@ class BaseTree(TreeClassifier):
         ValueError
             If input data is invalid or contains NaN/Inf values where not allowed.
         """
-        X = np.asarray(X, order="F", dtype=np.float64)
+        X = self._coerce_feature_matrix(X)
         y = np.asarray(y, order="C", dtype=np.float64)
-
-        if X.ndim != 2:
-            raise ValueError(
-                f"Expected a 2D array for input samples, but got an array with {X.ndim} dimensions."
-            )
 
         if X.shape[0] != y.shape[0]:
             raise ValueError(
@@ -424,25 +439,29 @@ class BaseTree(TreeClassifier):
                         f"Category column index {col_idx} exceeds X dimensions ({X.shape[1]} features)."
                     )
 
+            category_values = X[:, self.categories]
+
             # Kategorik sütunlardaki değerler negatif olmamalı
-            if (X[:, self.categories] < 0).any():
+            if (category_values < 0).any():
                 raise ValueError(
                     "X contains negative values in the specified category columns, which are not allowed."
                 )
 
-            if np.isnan(X[:, self.categories]).any():
+            if np.isnan(category_values).any():
                 raise ValueError(
                     "X contains null values in the specified category columns. Please encode them before passing."
                 )
 
             if is_fit:
-                self._categories = {
-                    idx: np.unique(X[:, idx]) for idx in self.categories
-                }
+                self._categories = {}
+                for offset, idx in enumerate(self.categories):
+                    self._categories[idx] = np.unique(category_values[:, offset])
 
             else:
-                for idx in self.categories:
-                    unknown = np.setdiff1d(np.unique(X[:, idx]), self._categories[idx])
+                for offset, idx in enumerate(self.categories):
+                    unknown = np.setdiff1d(
+                        np.unique(category_values[:, offset]), self._categories[idx]
+                    )
                     if len(unknown) > 0:
                         raise ValueError(
                             f"Unknown categories in column {idx}: {unknown}. "
@@ -480,19 +499,7 @@ class BaseTree(TreeClassifier):
         ValueError
             If the model has not been fitted yet.
         """
-        if not self._fit:
-            raise ValueError(
-                "The model has not been fitted yet. Please call `fit` first."
-            )
-
-        X = np.asarray(X, order="F", dtype=np.float64)
-
-        if X.ndim != 2:
-            raise ValueError(
-                f"Expected a 2D array for input samples, but got an array with {X.ndim} dimensions. "
-            )
-
-        self._validate_categories_in_data(X, is_fit=False)
+        X = self._prepare_inference_input(X)
 
         return super().apply(X)
 
@@ -515,19 +522,7 @@ class BaseTree(TreeClassifier):
         ValueError
             If the model has not been fitted yet.
         """
-        if not self._fit:
-            raise ValueError(
-                "The model has not been fitted yet. Please call `fit` first."
-            )
-
-        X = np.asarray(X, order="F", dtype=np.float64)
-
-        if X.ndim != 2:
-            raise ValueError(
-                f"Expected a 2D array for input samples, but got an array with {X.ndim} dimensions. "
-            )
-
-        self._validate_categories_in_data(X, is_fit=False)
+        X = self._prepare_inference_input(X)
 
         return super().predict(X)
 
@@ -647,7 +642,7 @@ class Classifier(BaseTree):
 
     def predict(self, X: ArrayLike) -> NDArray:
         """
-        Predict regression target for X.
+        Predict class labels for X.
 
         Parameters
         ----------
@@ -657,7 +652,7 @@ class Classifier(BaseTree):
         Returns
         -------
         y : NDArray of shape (n_samples,)
-            The predicted values.
+            The predicted class labels.
         """
         return np.argmax(super().predict(X), axis=1)
 

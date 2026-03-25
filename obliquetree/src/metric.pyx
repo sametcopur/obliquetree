@@ -143,7 +143,48 @@ cdef inline double calculate_mse_split(double first_subset_weight,
     # This is equivalent to minimizing the sum of squared errors
     return -(first_subset_weight * first_mean * first_mean + 
              second_subset_weight * second_mean * second_mean)
-             
+
+
+cdef inline double calculate_binary_split_impurity(
+    const bint task,
+    const double first_subset_weight,
+    const double total_sample_weight,
+    const double total_weighted_sum,
+    const double first_weighted_sum,
+) noexcept nogil:
+    if task == 0:
+        return calculate_gini_impurity(
+            first_subset_weight,
+            total_sample_weight,
+            total_weighted_sum,
+            first_weighted_sum,
+        )
+
+    return calculate_mse_split(
+        first_subset_weight,
+        total_sample_weight,
+        total_weighted_sum,
+        first_weighted_sum,
+    )
+
+
+cdef inline void update_best_binary_split(
+    const double curr_impurity,
+    const double threshold,
+    const int left_count,
+    const bint missing_go_left,
+    double* min_impurity,
+    double* out_threshold,
+    int* out_left_count,
+    bint* out_missing_go_left,
+) noexcept nogil:
+    if curr_impurity < min_impurity[0]:
+        min_impurity[0] = curr_impurity
+        out_threshold[0] = threshold
+        out_left_count[0] = left_count
+        out_missing_go_left[0] = missing_go_left
+
+
 cdef double feature_impurity(
     const bint task,
     const SortItem* sort_buffer,
@@ -165,7 +206,7 @@ cdef double feature_impurity(
     cdef double weighted_left_sum = 0.0, weighted_left_weight = 0.0
     cdef double weighted_left_weight_with_nan, curr_impurity
     cdef double min_impurity = INFINITY
-    cdef double curr_val, next_valx
+    cdef double curr_val, next_val
     
     for i in range(n_samples - n_nans - 1):
         # Get sample weight if available
@@ -186,34 +227,46 @@ cdef double feature_impurity(
             
         # Non-nan case
         if weighted_left_weight >= min_samples_leaf and (total_weight - weighted_left_weight) >= min_samples_leaf and n_nans != 0:
-
-            if task == 0:
-                curr_impurity = calculate_gini_impurity(weighted_left_weight, total_weight, total_weighted_sum, weighted_left_sum)
-            else:
-                curr_impurity = calculate_mse_split(weighted_left_weight, total_weight, total_weighted_sum, weighted_left_sum)
-
-            if curr_impurity < min_impurity:
-                min_impurity = curr_impurity
-                out_threshold[0] = 0.5 * (curr_val + next_val)
-                out_left_count[0] = i + 1
-                out_missing_go_left[0] = False
+            curr_impurity = calculate_binary_split_impurity(
+                task,
+                weighted_left_weight,
+                total_weight,
+                total_weighted_sum,
+                weighted_left_sum,
+            )
+            update_best_binary_split(
+                curr_impurity,
+                0.5 * (curr_val + next_val),
+                i + 1,
+                False,
+                &min_impurity,
+                out_threshold,
+                out_left_count,
+                out_missing_go_left,
+            )
         
         # NaN left case
         weighted_left_sum_with_nan = weighted_left_sum + nan_weighted_sum
         weighted_left_weight_with_nan = weighted_left_weight + nan_weight
         
         if weighted_left_weight_with_nan >= min_samples_leaf and (total_weight - weighted_left_weight_with_nan) >= min_samples_leaf:
-
-            if task == 0:
-                curr_impurity = calculate_gini_impurity(weighted_left_weight_with_nan, total_weight, total_weighted_sum, weighted_left_sum_with_nan)
-            else:
-                curr_impurity = calculate_mse_split(weighted_left_weight_with_nan, total_weight, total_weighted_sum, weighted_left_sum_with_nan)
-
-            if curr_impurity < min_impurity:
-                min_impurity = curr_impurity
-                out_threshold[0] = 0.5 * (curr_val + next_val)
-                out_left_count[0] = i + 1 + n_nans
-                out_missing_go_left[0] = True
+            curr_impurity = calculate_binary_split_impurity(
+                task,
+                weighted_left_weight_with_nan,
+                total_weight,
+                total_weighted_sum,
+                weighted_left_sum_with_nan,
+            )
+            update_best_binary_split(
+                curr_impurity,
+                0.5 * (curr_val + next_val),
+                i + 1 + n_nans,
+                True,
+                &min_impurity,
+                out_threshold,
+                out_left_count,
+                out_missing_go_left,
+            )
                 
     return min_impurity
 
@@ -250,34 +303,46 @@ cdef double category_impurity(
         
         # NaN'lar sağda
         if weighted_left_weight >= min_samples_leaf and (total_weight - weighted_left_weight) >= min_samples_leaf and n_nans != 0:
-            
-            if task == 0:
-                curr_impurity = calculate_gini_impurity(weighted_left_weight, total_weight, total_weighted_sum, weighted_left_sum)
-            else:
-                curr_impurity = calculate_mse_split(weighted_left_weight, total_weight, total_weighted_sum, weighted_left_sum)
-
-            if curr_impurity < min_impurity:
-                min_impurity = curr_impurity
-                out_threshold[0] = i
-                out_left_count[0] = left_count
-                out_missing_go_left[0] = False
+            curr_impurity = calculate_binary_split_impurity(
+                task,
+                weighted_left_weight,
+                total_weight,
+                total_weighted_sum,
+                weighted_left_sum,
+            )
+            update_best_binary_split(
+                curr_impurity,
+                i,
+                left_count,
+                False,
+                &min_impurity,
+                out_threshold,
+                out_left_count,
+                out_missing_go_left,
+            )
 
 
         # NaN'lar solda
         weighted_left_sum_with_nan = weighted_left_sum + nan_weighted_sum
         weighted_left_weight_with_nan = weighted_left_weight + nan_weight
         if weighted_left_weight_with_nan >= min_samples_leaf and (total_weight - weighted_left_weight_with_nan) >= min_samples_leaf:
-            
-            if task == 0:
-                curr_impurity = calculate_gini_impurity(weighted_left_weight_with_nan, total_weight, total_weighted_sum, weighted_left_sum_with_nan)
-            else:
-                curr_impurity = calculate_mse_split(weighted_left_weight_with_nan, total_weight, total_weighted_sum, weighted_left_sum_with_nan)
-
-            if curr_impurity < min_impurity:
-                min_impurity = curr_impurity
-                out_threshold[0] = i
-                out_left_count[0] = left_count + n_nans
-                out_missing_go_left[0] = True
+            curr_impurity = calculate_binary_split_impurity(
+                task,
+                weighted_left_weight_with_nan,
+                total_weight,
+                total_weighted_sum,
+                weighted_left_sum_with_nan,
+            )
+            update_best_binary_split(
+                curr_impurity,
+                i,
+                left_count + n_nans,
+                True,
+                &min_impurity,
+                out_threshold,
+                out_left_count,
+                out_missing_go_left,
+            )
 
     return min_impurity
 
