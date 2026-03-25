@@ -35,7 +35,6 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
-    "sphinx_autodoc_typehints",
     "sphinx_rtd_theme",
     "sphinx.ext.mathjax",
     "myst_parser",
@@ -58,11 +57,9 @@ napoleon_type_aliases = {
 }
 
 # Type hints settings
-autodoc_typehints = "description"
-autodoc_typehints_format = "short"
-always_document_param_types = True
-typehints_fully_qualified = False
-typehints_document_rtype = True
+# Use "none" so Sphinx does not render type annotations from signatures.
+# Types are documented in numpy-style docstrings instead (like scikit-learn).
+autodoc_typehints = "none"
 
 # Additional settings for numpy docstring format
 napoleon_numpy_docstring = True
