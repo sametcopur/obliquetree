@@ -1,4 +1,4 @@
-from libc.math cimport INFINITY, exp, log, fabs
+from libc.math cimport INFINITY, exp, log, fabs, sqrt
 from libc.stdlib cimport malloc, free, calloc
 from libc.string cimport memcpy, memset
 
@@ -9,6 +9,10 @@ from cython.parallel cimport prange
 cimport openmp
 
 from .utils cimport sort_pointer_array
+
+DEF MIN_SCREEN_PAIRS = 64
+DEF MIN_SCREEN_SURVIVORS = 4
+DEF SCREEN_KEEP_DIVISOR = 5
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +426,58 @@ cdef inline double inf_norm(const double* a, Py_ssize_t n) noexcept nogil:
     return mx
 
 
+cdef double proxy_screen_nogil(
+    const bint task_, const int n_classes,
+    const double current_class, const bint linear,
+    double* x,
+    const double* X_pair,
+    const double* y_data, const double* sample_weight,
+    const double total_weight,
+    const Py_ssize_t N, const Py_ssize_t d,
+    const double gamma, const double eps, const double pgtol,
+    double* grad, double* grad_new, double* x_new,
+    double* buf_z, double* buf_p, double* buf_dp_dz,
+    double* buf1, double* buf2, double* buf3,
+    double* buf4, double* buf5, double* buf6, double* buf7,
+) noexcept nogil:
+    cdef Py_ssize_t i
+    cdef int attempt
+    cdef double f_best, f_trial, grad_norm, step
+    cdef double step_scale
+
+    f_best = eval_loss_grad(
+        task_, n_classes, current_class, linear,
+        X_pair, y_data, sample_weight, x,
+        N, d, gamma, eps, total_weight, grad,
+        buf_z, buf_p, buf_dp_dz,
+        buf1, buf2, buf3, buf4, buf5, buf6, buf7)
+
+    grad_norm = inf_norm(grad, d)
+    if grad_norm <= pgtol:
+        return f_best
+
+    step = 1.0 / grad_norm
+    for attempt in range(2):
+        step_scale = 1.0 if attempt == 0 else 0.25
+        for i in range(d):
+            x_new[i] = x[i] - step_scale * step * grad[i]
+
+        f_trial = eval_loss_grad(
+            task_, n_classes, current_class, linear,
+            X_pair, y_data, sample_weight, x_new,
+            N, d, gamma, eps, total_weight, grad_new,
+            buf_z, buf_p, buf_dp_dz,
+            buf1, buf2, buf3, buf4, buf5, buf6, buf7)
+
+        if f_trial < f_best:
+            memcpy(x, x_new, d * sizeof(double))
+            memcpy(grad, grad_new, d * sizeof(double))
+            f_best = f_trial
+            break
+
+    return f_best
+
+
 cdef double lbfgs_minimize_nogil(
     const bint task_, const int n_classes,
     const double current_class, const bint linear,
@@ -565,7 +621,12 @@ cdef struct ThreadWorkspace:
     double* buf6
     double* buf7
     double* x_work
-    double* X_pair    # (N * n_pair) contiguous gather target
+    double* X_pair       # (N * n_pair) contiguous gather target
+    double* pair_best_weights  # best weights for current pair across ci loop
+    # thread-local best tracking
+    double  best_loss
+    double* best_weights  # (n_pair,)
+    Py_ssize_t best_pi    # pair index of best
 
 
 cdef bint _check_ws(ThreadWorkspace* w, bint task_, bint linear,
@@ -573,7 +634,7 @@ cdef bint _check_ws(ThreadWorkspace* w, bint task_, bint linear,
     if (w.grad == NULL or w.grad_new == NULL or w.direction == NULL or
         w.x_new == NULL or w.s_hist == NULL or w.y_hist == NULL or
         w.rho == NULL or w.alpha_buf == NULL or w.x_work == NULL or
-        w.X_pair == NULL or
+        w.X_pair == NULL or w.pair_best_weights == NULL or w.best_weights == NULL or
         w.buf_z == NULL or w.buf_p == NULL or w.buf_dp_dz == NULL):
         return False
     if task_ == 0:
@@ -612,6 +673,10 @@ cdef ThreadWorkspace* alloc_workspaces(
         ws[t].alpha_buf = <double*>malloc(lbfgs_m * sizeof(double))
         ws[t].x_work    = <double*>malloc(d * sizeof(double))
         ws[t].X_pair    = <double*>malloc(N * d * sizeof(double))
+        ws[t].pair_best_weights = <double*>malloc(d * sizeof(double))
+        ws[t].best_weights = <double*>malloc(d * sizeof(double))
+        ws[t].best_loss = INFINITY
+        ws[t].best_pi   = 0
 
         ws[t].buf_z     = <double*>malloc(N * sizeof(double))
         ws[t].buf_p     = <double*>malloc(N * sizeof(double))
@@ -665,6 +730,7 @@ cdef void free_workspaces(ThreadWorkspace* ws, int n_threads) noexcept:
         free(ws[t].s_hist);    free(ws[t].y_hist)
         free(ws[t].rho);       free(ws[t].alpha_buf)
         free(ws[t].x_work);    free(ws[t].X_pair)
+        free(ws[t].pair_best_weights); free(ws[t].best_weights)
         free(ws[t].buf_z);     free(ws[t].buf_p);  free(ws[t].buf_dp_dz)
         free(ws[t].buf1);      free(ws[t].buf2);   free(ws[t].buf3)
         free(ws[t].buf4);      free(ws[t].buf5)
@@ -676,11 +742,40 @@ cdef void free_workspaces(ThreadWorkspace* ws, int n_threads) noexcept:
 # C-level pair generation
 # ---------------------------------------------------------------------------
 cdef Py_ssize_t count_pairs(Py_ssize_t n, int n_pair) noexcept nogil:
+    """C(n, n_pair) — combinations count."""
+    if n < n_pair:
+        return 0
     if n_pair == 2:
         return n * (n - 1) // 2
     elif n_pair == 3:
         return n * (n - 1) * (n - 2) // 6
-    return 0
+    # General: C(n, k) via iterative multiply
+    cdef Py_ssize_t result = 1
+    cdef Py_ssize_t i
+    cdef int k = n_pair
+    if k > n - k:
+        k = <int>(n - k)
+    for i in range(k):
+        result = result * (n - i) // (i + 1)
+    return result
+
+# ---------------------------------------------------------------------------
+# Deterministic per-pair x0 init from seed + pair index  (no Python RNG)
+# ---------------------------------------------------------------------------
+cdef inline void init_x0_deterministic(
+    double* x, Py_ssize_t d, unsigned long long seed,
+    Py_ssize_t pair_idx) noexcept nogil:
+    """Simple hash-based init producing values in roughly [-1, 1]."""
+    cdef unsigned long long h
+    cdef Py_ssize_t j
+    for j in range(d):
+        h = seed ^ (<unsigned long long>(pair_idx * 31 + j) * 6364136223846793005ULL + 1442695040888963407ULL)
+        h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL
+        h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL
+        h = h ^ (h >> 31)
+        # Map to [-1, 1]
+        x[j] = (<double>(h & <unsigned long long>0xFFFFFFFF) / 2147483648.0) - 1.0
+
 
 cdef void generate_pairs_2(const int* features, Py_ssize_t n_feat,
                            int* out) noexcept nogil:
@@ -703,9 +798,540 @@ cdef void generate_pairs_3(const int* features, Py_ssize_t n_feat,
                 idx += 1
 
 
+cdef void generate_combinations(
+    const int* features, Py_ssize_t n_feat, int n_pair,
+    int* out,
+) noexcept nogil:
+    """General C(n_feat, n_pair) generator via stack-based iteration."""
+    cdef int* stack = <int*>malloc(n_pair * sizeof(int))
+    if stack == NULL:
+        return
+    cdef Py_ssize_t idx = 0
+    cdef int depth = 0, start
+    cdef Py_ssize_t j
+
+    stack[0] = 0
+    while depth >= 0:
+        if depth == n_pair:
+            for j in range(n_pair):
+                out[idx * n_pair + j] = features[stack[j]]
+            idx += 1
+            depth -= 1
+            if depth >= 0:
+                stack[depth] += 1
+        elif stack[depth] <= <int>n_feat - (n_pair - depth):
+            if depth + 1 < n_pair:
+                stack[depth + 1] = stack[depth] + 1
+            depth += 1
+        else:
+            depth -= 1
+            if depth >= 0:
+                stack[depth] += 1
+    free(stack)
+
+
+# ---------------------------------------------------------------------------
+# Feature scoring: weighted abs correlation with y  (nogil, O(N) per feature)
+# ---------------------------------------------------------------------------
+cdef void score_features(
+    const bint task,
+    const int n_classes,
+    const double* X, Py_ssize_t full_N,
+    const int* row_idx, Py_ssize_t N,
+    const int* features, Py_ssize_t n_feat,
+    const double* y_full, const double* sw_full, double total_sw,
+    double* scores,  # output (n_feat,)
+) noexcept nogil:
+    """Cheap feature ranking for top-k oblique search."""
+    cdef Py_ssize_t f, i, cls_idx
+    cdef int col, yi_int
+    cdef double mean_y, mean_x, cov, var_x, var_y
+    cdef double xi, yi, wi
+    cdef double between_var, denom, cls_mean, diff
+    cdef const double* col_ptr
+    cdef double* class_weight = NULL
+    cdef double* class_sum = NULL
+    cdef bint use_multiclass_score = task == 0 and n_classes > 2
+
+    if total_sw <= 0.0:
+        for f in range(n_feat):
+            scores[f] = 0.0
+        return
+
+    mean_y = 0.0
+    var_y = 0.0
+    if not use_multiclass_score:
+        for i in range(N):
+            mean_y += sw_full[row_idx[i]] * y_full[row_idx[i]]
+        mean_y /= total_sw
+
+        for i in range(N):
+            wi = sw_full[row_idx[i]]
+            yi = y_full[row_idx[i]] - mean_y
+            var_y += wi * yi * yi
+    else:
+        class_weight = <double*>malloc(n_classes * sizeof(double))
+        class_sum = <double*>malloc(n_classes * sizeof(double))
+        if class_weight == NULL or class_sum == NULL:
+            free(class_weight)
+            free(class_sum)
+            use_multiclass_score = False
+
+            for i in range(N):
+                mean_y += sw_full[row_idx[i]] * y_full[row_idx[i]]
+            mean_y /= total_sw
+
+            for i in range(N):
+                wi = sw_full[row_idx[i]]
+                yi = y_full[row_idx[i]] - mean_y
+                var_y += wi * yi * yi
+
+    for f in range(n_feat):
+        col = features[f]
+        col_ptr = X + <Py_ssize_t>col * full_N
+
+        mean_x = 0.0
+        for i in range(N):
+            mean_x += sw_full[row_idx[i]] * col_ptr[row_idx[i]]
+        mean_x /= total_sw
+
+        cov = 0.0; var_x = 0.0
+        if use_multiclass_score:
+            memset(class_weight, 0, n_classes * sizeof(double))
+            memset(class_sum, 0, n_classes * sizeof(double))
+
+            for i in range(N):
+                xi = col_ptr[row_idx[i]] - mean_x
+                wi = sw_full[row_idx[i]]
+                yi_int = <int>y_full[row_idx[i]]
+                var_x += wi * xi * xi
+                class_weight[yi_int] += wi
+                class_sum[yi_int] += wi * col_ptr[row_idx[i]]
+
+            if var_x <= 0.0:
+                scores[f] = 0.0
+                continue
+
+            between_var = 0.0
+            for cls_idx in range(n_classes):
+                if class_weight[cls_idx] <= 0.0:
+                    continue
+                cls_mean = class_sum[cls_idx] / class_weight[cls_idx]
+                diff = cls_mean - mean_x
+                between_var += class_weight[cls_idx] * diff * diff
+            scores[f] = between_var / var_x
+            continue
+
+        for i in range(N):
+            xi = col_ptr[row_idx[i]] - mean_x
+            yi = y_full[row_idx[i]] - mean_y
+            wi = sw_full[row_idx[i]]
+            cov += wi * xi * yi
+            var_x += wi * xi * xi
+
+        if var_x > 0.0 and var_y > 0.0:
+            denom = sqrt(var_x * var_y)
+            if denom > 0.0:
+                scores[f] = fabs(cov) / denom
+            else:
+                scores[f] = 0.0
+        else:
+            scores[f] = 0.0
+
+    free(class_weight)
+    free(class_sum)
+
+# ---------------------------------------------------------------------------
+# Simple top-k selection via partial insertion sort  (nogil, O(n * k))
+# ---------------------------------------------------------------------------
+cdef void topk_indices(
+    const double* scores, Py_ssize_t n,
+    int* out, Py_ssize_t k,          # output: indices of top-k
+    const int* features,              # map score index -> feature id
+) noexcept nogil:
+    """Select k indices with largest scores.  O(n*k), fine for n < ~100."""
+    cdef Py_ssize_t i, j, pos
+    cdef double s
+    # init with -INF
+    cdef double* vals = <double*>malloc(k * sizeof(double))
+    if vals == NULL:
+        for i in range(k):
+            out[i] = features[i]
+        return
+    for i in range(k):
+        vals[i] = -INFINITY
+        out[i] = features[0]
+
+    for i in range(n):
+        s = scores[i]
+        if s > vals[k - 1]:
+            # insert
+            pos = k - 1
+            while pos > 0 and s > vals[pos - 1]:
+                vals[pos] = vals[pos - 1]
+                out[pos] = out[pos - 1]
+                pos -= 1
+            vals[pos] = s
+            out[pos] = features[i]
+    free(vals)
+
+
 # ---------------------------------------------------------------------------
 # analyze()
 # ---------------------------------------------------------------------------
+cdef int* prepare_candidate_pairs(
+                const bint task,
+                const int n_classes,
+                np.ndarray[double, ndim=2] X,
+                np.ndarray[double, ndim=1] y,
+                np.ndarray[double, ndim=1] sample_weight,
+                const int* sample_indices,
+                const int n_samples,
+                const int n_pair,
+                const bint* is_categorical,
+                Py_ssize_t* out_n_fp,
+              ) noexcept:
+    cdef Py_ssize_t N = n_samples
+    cdef Py_ssize_t d = X.shape[1]
+    cdef Py_ssize_t full_N = X.shape[0]
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n_usable = 0
+    cdef Py_ssize_t k
+    cdef Py_ssize_t n_fp
+    cdef double sum_sw = 0.0
+    cdef int* usable = NULL
+    cdef int* selected = NULL
+    cdef int* topk_buf = NULL
+    cdef int* pair_idx = NULL
+    cdef double* f_scores = NULL
+    cdef double* X_ptr
+    cdef double* y_ptr
+    cdef double* sw_ptr
+
+    out_n_fp[0] = 0
+
+    usable = <int*>malloc(d * sizeof(int))
+    if usable == NULL:
+        return NULL
+
+    if is_categorical:
+        for i in range(d):
+            if not is_categorical[i]:
+                usable[n_usable] = <int>i
+                n_usable += 1
+    else:
+        for i in range(d):
+            usable[i] = <int>i
+        n_usable = d
+
+    if n_usable < n_pair:
+        free(usable)
+        return NULL
+
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    X_ptr = <double*>np.PyArray_DATA(X)
+    y_ptr = <double*>np.PyArray_DATA(y)
+    sw_ptr = <double*>np.PyArray_DATA(sample_weight)
+
+    for i in range(N):
+        sum_sw += sw_ptr[sample_indices[i]]
+
+    k = <Py_ssize_t>sqrt(<double>n_usable)
+    if k < 2 * n_pair:
+        k = 2 * n_pair
+    if k > n_usable:
+        k = n_usable
+
+    selected = usable
+    if k < n_usable:
+        f_scores = <double*>malloc(n_usable * sizeof(double))
+        topk_buf = <int*>malloc(k * sizeof(int))
+        if f_scores == NULL or topk_buf == NULL:
+            free(f_scores)
+            free(topk_buf)
+            free(usable)
+            return NULL
+
+        score_features(task, n_classes, X_ptr, full_N, sample_indices, N,
+                       usable, n_usable, y_ptr, sw_ptr, sum_sw, f_scores)
+        topk_indices(f_scores, n_usable, topk_buf, k, usable)
+        free(f_scores)
+        selected = topk_buf
+
+    n_fp = count_pairs(k, n_pair)
+    if n_fp > 0:
+        pair_idx = <int*>malloc(n_fp * n_pair * sizeof(int))
+        if pair_idx != NULL:
+            if n_pair == 2:
+                generate_pairs_2(selected, k, pair_idx)
+            elif n_pair == 3:
+                generate_pairs_3(selected, k, pair_idx)
+            else:
+                generate_combinations(selected, k, n_pair, pair_idx)
+            out_n_fp[0] = n_fp
+
+    if selected != usable:
+        free(selected)
+    free(usable)
+    return pair_idx
+
+
+cdef tuple[double*, int*] _analyze_from_pairs_compact(
+                const bint task,
+                const int n_classes,
+                const bint linear,
+                np.ndarray[double, ndim=2] X,
+                np.ndarray[double, ndim=1] y_sub,
+                np.ndarray[double, ndim=1] sw_sub,
+                const double sum_sw,
+                const int* sample_indices,
+                SortItem* sort_buffer,
+                const int n_samples,
+                const int n_pair,
+                const int* pair_idx,
+                const Py_ssize_t n_fp,
+                object rng,
+                const double gamma,
+                const int maxiter,
+                const double relative_change,
+              ) noexcept:
+    cdef Py_ssize_t N = n_samples
+    cdef Py_ssize_t full_N = X.shape[0]
+    cdef Py_ssize_t i
+    cdef int* best_pair = NULL
+    cdef double* best_x = NULL
+    cdef double best_fx = INFINITY
+    cdef double* X_ptr
+    cdef double* y_ptr
+    cdef double* sw_ptr
+    cdef unsigned long long rng_seed
+    cdef int n_threads = openmp.omp_get_max_threads()
+    cdef int lbfgs_m = 10
+    cdef ThreadWorkspace* ws = NULL
+    cdef int t
+    cdef Py_ssize_t pi, fi
+    cdef int tid, ci
+    cdef double f_val
+    cdef double pair_best_f
+    cdef ThreadWorkspace* w
+    cdef int multi_range = 1
+    cdef Py_ssize_t n_survivors, surv_target
+    cdef double* screen_losses = NULL
+    cdef double* screen_weights = NULL
+    cdef Py_ssize_t* surv_idx = NULL
+    cdef bint do_screen
+    cdef Py_ssize_t j_s
+    cdef double loss_j
+    cdef Py_ssize_t si, real_pi
+    cdef Py_ssize_t best_job = 0
+    cdef double max_abs = 0.0
+    cdef double bv
+
+    if pair_idx == NULL or n_fp <= 0:
+        return NULL, NULL
+
+    best_pair = <int*>malloc(n_pair * sizeof(int))
+    best_x = <double*>malloc(n_pair * sizeof(double))
+    if best_pair == NULL or best_x == NULL:
+        free(best_pair); free(best_x)
+        return NULL, NULL
+
+    # Ensure X is Fortran-order
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    X_ptr = <double*>np.PyArray_DATA(X)
+    y_ptr = <double*>np.PyArray_DATA(y_sub)
+    sw_ptr = <double*>np.PyArray_DATA(sw_sub)
+
+    # Derive deterministic seed from rng
+    rng_seed = <unsigned long long>rng.integers(0, 2**63)
+
+    # Workspaces
+    ws = alloc_workspaces(
+        n_threads, N, n_pair, lbfgs_m, n_classes, task, linear)
+    if ws == NULL:
+        free(best_pair); free(best_x)
+        return NULL, NULL
+
+    if linear and n_classes > 2:
+        multi_range = n_classes
+
+    # ===================================================================
+    # Phase 3: Cheap proxy screening on all pairs
+    # ===================================================================
+    # Skip screening when top-k has already reduced the pair set enough.
+    do_screen = n_fp >= MIN_SCREEN_PAIRS
+
+    if do_screen:
+        screen_losses = <double*>malloc(n_fp * sizeof(double))
+        screen_weights = <double*>malloc(n_fp * n_pair * sizeof(double))
+        if screen_losses == NULL or screen_weights == NULL:
+            free(screen_losses)
+            free(screen_weights)
+            screen_losses = NULL
+            screen_weights = NULL
+            do_screen = False
+
+    if do_screen:
+        for pi in prange(n_fp, nogil=True, schedule="dynamic"):
+            tid = openmp.omp_get_thread_num()
+            w = &ws[tid]
+
+            gather_X_pair(X_ptr, full_N, sample_indices, N,
+                          &pair_idx[pi * n_pair], n_pair, w.X_pair)
+            init_x0_deterministic(w.x_work, n_pair, rng_seed, pi)
+            memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
+            pair_best_f = INFINITY
+            for ci in range(multi_range):
+                memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                memset(w.rho, 0, lbfgs_m * sizeof(double))
+                f_val = proxy_screen_nogil(
+                    task, n_classes, <double>ci, linear,
+                    w.x_work, w.X_pair, y_ptr, sw_ptr, sum_sw,
+                    N, n_pair, gamma, 1e-6, 1e-5,
+                    w.grad, w.grad_new, w.x_new,
+                    w.buf_z, w.buf_p, w.buf_dp_dz,
+                    w.buf1, w.buf2, w.buf3,
+                    w.buf4, w.buf5, w.buf6, w.buf7)
+                if f_val < pair_best_f:
+                    pair_best_f = f_val
+                    memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+            screen_losses[pi] = pair_best_f
+            memcpy(&screen_weights[pi * n_pair], w.pair_best_weights, n_pair * sizeof(double))
+
+        # Keep only a small survivor set when screening is actually worthwhile.
+        surv_target = n_fp // SCREEN_KEEP_DIVISOR
+        if surv_target < MIN_SCREEN_SURVIVORS:
+            surv_target = MIN_SCREEN_SURVIVORS
+        if surv_target > n_fp:
+            surv_target = n_fp
+
+        # Find threshold: partial sort via finding the surv_target-th smallest
+        # Simple approach: collect all losses and pick threshold
+        surv_idx = <Py_ssize_t*>malloc(n_fp * sizeof(Py_ssize_t))
+        if surv_idx == NULL:
+            free(screen_losses)
+            free(screen_weights)
+            screen_losses = NULL
+            screen_weights = NULL
+            do_screen = False
+
+    if do_screen:
+        n_survivors = 0
+        for i in range(n_fp):
+            # Insert into sorted surv_idx
+            loss_j = screen_losses[i]
+            if n_survivors < surv_target:
+                # Find insert position
+                j_s = n_survivors
+                while j_s > 0 and screen_losses[surv_idx[j_s - 1]] > loss_j:
+                    surv_idx[j_s] = surv_idx[j_s - 1]
+                    j_s -= 1
+                surv_idx[j_s] = i
+                n_survivors += 1
+            elif loss_j < screen_losses[surv_idx[n_survivors - 1]]:
+                # Replace worst survivor
+                j_s = n_survivors - 1
+                while j_s > 0 and screen_losses[surv_idx[j_s - 1]] > loss_j:
+                    surv_idx[j_s] = surv_idx[j_s - 1]
+                    j_s -= 1
+                surv_idx[j_s] = i
+        free(screen_losses)
+    else:
+        free(screen_weights)
+        screen_weights = NULL
+        # No screening: all pairs are survivors
+        n_survivors = n_fp
+        surv_idx = <Py_ssize_t*>malloc(n_fp * sizeof(Py_ssize_t))
+        if surv_idx != NULL:
+            for i in range(n_fp):
+                surv_idx[i] = i
+        else:
+            free(best_pair); free(best_x)
+            free_workspaces(ws, n_threads)
+            return NULL, NULL
+
+    # ===================================================================
+    # Phase 4: Full optimization on survivors only
+    # ===================================================================
+    for t in range(n_threads):
+        ws[t].best_loss = INFINITY
+        ws[t].best_pi = 0
+
+    for si in prange(n_survivors, nogil=True, schedule="dynamic"):
+        tid = openmp.omp_get_thread_num()
+        w = &ws[tid]
+        real_pi = surv_idx[si]
+
+        gather_X_pair(X_ptr, full_N, sample_indices, N,
+                      &pair_idx[real_pi * n_pair], n_pair, w.X_pair)
+        if do_screen:
+            memcpy(w.x_work, &screen_weights[real_pi * n_pair], n_pair * sizeof(double))
+        else:
+            init_x0_deterministic(w.x_work, n_pair, rng_seed, real_pi)
+        memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
+        pair_best_f = INFINITY
+        for ci in range(multi_range):
+            memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
+            memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
+            memset(w.rho, 0, lbfgs_m * sizeof(double))
+            f_val = lbfgs_minimize_nogil(
+                task, n_classes, <double>ci, linear,
+                w.x_work, w.X_pair, y_ptr, sw_ptr, sum_sw,
+                N, n_pair, gamma, 1e-6, lbfgs_m,
+                maxiter, relative_change, 1e-5, 20,
+                w.grad, w.grad_new, w.direction, w.x_new,
+                w.s_hist, w.y_hist, w.rho, w.alpha_buf,
+                w.buf_z, w.buf_p, w.buf_dp_dz,
+                w.buf1, w.buf2, w.buf3,
+                w.buf4, w.buf5, w.buf6, w.buf7)
+            if f_val < pair_best_f:
+                pair_best_f = f_val
+                memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
+        if pair_best_f < w.best_loss:
+            w.best_loss = pair_best_f
+            w.best_pi = real_pi
+            memcpy(w.best_weights, w.pair_best_weights, n_pair * sizeof(double))
+
+    free(surv_idx)
+    free(screen_weights)
+
+    # --- Final reduction across threads ---
+    for t in range(n_threads):
+        if ws[t].best_loss < best_fx:
+            best_fx = ws[t].best_loss
+            best_job = ws[t].best_pi
+            memcpy(best_x, ws[t].best_weights, n_pair * sizeof(double))
+
+    # Normalize weights
+    for i in range(n_pair):
+        if fabs(best_x[i]) > max_abs:
+            max_abs = fabs(best_x[i])
+    if max_abs == 0.0:
+        max_abs = 1.0
+    for i in range(n_pair):
+        best_pair[i] = pair_idx[best_job * n_pair + i]
+        best_x[i] = best_x[i] / max_abs
+
+    # Compute projected values and sort
+    with nogil:
+        for i in range(N):
+            bv = 0.0
+            for fi in range(n_pair):
+                bv += X_ptr[sample_indices[i] + <Py_ssize_t>best_pair[fi] * full_N] * best_x[fi]
+            sort_buffer[i].value = bv
+            sort_buffer[i].index = sample_indices[i]
+        sort_pointer_array(sort_buffer, N)
+
+    free_workspaces(ws, n_threads)
+    return best_x, best_pair
+
+
 cdef tuple[double*, int*] analyze(
                 const bint task,
                 const int n_classes,
@@ -723,173 +1349,189 @@ cdef tuple[double*, int*] analyze(
                 const int maxiter,
                 const double relative_change,
               ) noexcept:
-
-    # y, sample_weight compact; X stays global
-    cdef np.ndarray[int, ndim=1] sample_dx = np.frombuffer(
-        <bytes>(<char*>sample_indices)[:n_samples * sizeof(int)], dtype=np.int32)
-    cdef np.ndarray[double, ndim=1] y_sub = y[sample_dx].copy()
-    cdef np.ndarray[double, ndim=1] sw_sub = sample_weight[sample_dx].copy()
-
-    cdef double sum_sw = sw_sub.sum()
-    cdef Py_ssize_t N = n_samples
-    cdef Py_ssize_t d = X.shape[1]
-    cdef Py_ssize_t full_N = X.shape[0]
-    cdef Py_ssize_t i
-
-    cdef int* best_pair = NULL
+    cdef Py_ssize_t n_fp = 0
+    cdef int* pair_idx = NULL
     cdef double* best_x = NULL
-    cdef double best_fx = INFINITY
+    cdef int* best_pair = NULL
+    cdef np.ndarray[int, ndim=1] sample_dx
+    cdef np.ndarray[double, ndim=1] y_sub
+    cdef np.ndarray[double, ndim=1] sw_sub
+    cdef double sum_sw
+    pair_idx = prepare_candidate_pairs(
+        task,
+        n_classes,
+        X,
+        y,
+        sample_weight,
+        sample_indices,
+        n_samples,
+        n_pair,
+        is_categorical,
+        &n_fp,
+    )
 
-    # Build usable-feature list
-    cdef int* usable = <int*>malloc(d * sizeof(int))
-    if usable == NULL:
-        return NULL, NULL
-    cdef Py_ssize_t n_usable = 0
-
-    if is_categorical:
-        for i in range(d):
-            if not is_categorical[i]:
-                usable[n_usable] = <int>i
-                n_usable += 1
-    else:
-        for i in range(d):
-            usable[i] = <int>i
-        n_usable = d
-
-    if n_usable < n_pair:
-        free(usable)
-        return best_x, best_pair
-
-    cdef Py_ssize_t n_fp = count_pairs(n_usable, n_pair)
-    if n_fp == 0:
-        free(usable)
-        return best_x, best_pair
-
-    # Generate pairs in C
-    cdef int* pair_idx = <int*>malloc(n_fp * n_pair * sizeof(int))
-    if pair_idx == NULL:
-        free(usable)
-        return NULL, NULL
-    if n_pair == 2:
-        generate_pairs_2(usable, n_usable, pair_idx)
-    elif n_pair == 3:
-        generate_pairs_3(usable, n_usable, pair_idx)
-    free(usable)
-
-    best_pair = <int*>malloc(n_pair * sizeof(int))
-    best_x = <double*>malloc(n_pair * sizeof(double))
-    if best_pair == NULL or best_x == NULL:
-        free(best_pair); free(best_x); free(pair_idx)
+    if pair_idx == NULL or n_fp == 0:
         return NULL, NULL
 
-    # Ensure X is Fortran-order
-    if not X.flags['F_CONTIGUOUS']:
-        X = np.asfortranarray(X)
-    cdef double* X_ptr = <double*>np.PyArray_DATA(X)
+    sample_dx = np.frombuffer(
+        <bytes>(<char*>sample_indices)[:n_samples * sizeof(int)], dtype=np.int32)
+    y_sub = y[sample_dx].copy()
+    sw_sub = sample_weight[sample_dx].copy()
+    sum_sw = sw_sub.sum()
 
-    # Pre-generate x0
-    cdef np.ndarray[double, ndim=2] all_x0 = rng.standard_normal(
-        (n_fp, n_pair)).astype(np.float64)
-    cdef double* x0_ptr = <double*>np.PyArray_DATA(all_x0)
-
-    cdef double* y_ptr = <double*>np.PyArray_DATA(y_sub)
-    cdef double* sw_ptr = <double*>np.PyArray_DATA(sw_sub)
-
-    # Workspaces
-    cdef int n_threads = openmp.omp_get_max_threads()
-    cdef int lbfgs_m = 10
-    cdef ThreadWorkspace* ws = alloc_workspaces(
-        n_threads, N, n_pair, lbfgs_m, n_classes, task, linear)
-    if ws == NULL:
-        free(pair_idx); free(best_pair); free(best_x)
-        return NULL, NULL
-
-    # Results
-    cdef double* losses = <double*>malloc(n_fp * sizeof(double))
-    cdef double* weights = <double*>malloc(n_fp * n_pair * sizeof(double))
-    if losses == NULL or weights == NULL:
-        free(pair_idx); free(losses); free(weights)
-        free(best_pair); free(best_x)
-        free_workspaces(ws, n_threads)
-        return NULL, NULL
-
-    for i in range(n_fp):
-        losses[i] = INFINITY
-
-    # --- Parallel loop ---
-    cdef Py_ssize_t pi, fi
-    cdef int tid, ci
-    cdef double f_val
-    cdef ThreadWorkspace* w
-    cdef int multi_range = 1
-    if linear and n_classes > 2:
-        multi_range = n_classes
-
-    for pi in prange(n_fp, nogil=True, schedule="dynamic"):
-        tid = openmp.omp_get_thread_num()
-        w = &ws[tid]
-
-        # Gather pair columns into contiguous X_pair
-        gather_X_pair(X_ptr, full_N,
-                      sample_indices, N,
-                      &pair_idx[pi * n_pair], n_pair,
-                      w.X_pair)
-
-        # Copy x0
-        memcpy(w.x_work, &x0_ptr[pi * n_pair], n_pair * sizeof(double))
-
-        # Class loop inside (warm-start for linear multiclass)
-        f_val = INFINITY
-        for ci in range(multi_range):
-            memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
-            memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
-            memset(w.rho, 0, lbfgs_m * sizeof(double))
-
-            f_val = lbfgs_minimize_nogil(
-                task, n_classes, <double>ci, linear,
-                w.x_work,
-                w.X_pair, y_ptr, sw_ptr, sum_sw,
-                N, n_pair,
-                gamma, 1e-6, lbfgs_m, maxiter, relative_change,
-                1e-5, 20,
-                w.grad, w.grad_new, w.direction, w.x_new,
-                w.s_hist, w.y_hist, w.rho, w.alpha_buf,
-                w.buf_z, w.buf_p, w.buf_dp_dz,
-                w.buf1, w.buf2, w.buf3,
-                w.buf4, w.buf5, w.buf6, w.buf7)
-
-        losses[pi] = f_val
-        memcpy(&weights[pi * n_pair], w.x_work, n_pair * sizeof(double))
-
-    # Find best
-    cdef Py_ssize_t best_job = 0
-    for i in range(n_fp):
-        if losses[i] < best_fx:
-            best_fx = losses[i]
-            best_job = i
-
-    cdef double max_abs = 0.0
-    for i in range(n_pair):
-        if fabs(weights[best_job * n_pair + i]) > max_abs:
-            max_abs = fabs(weights[best_job * n_pair + i])
-    if max_abs == 0.0:
-        max_abs = 1.0
-
-    for i in range(n_pair):
-        best_pair[i] = pair_idx[best_job * n_pair + i]
-        best_x[i] = weights[best_job * n_pair + i] / max_abs
-
-    # Compute projected values and sort (gathered from global X)
-    cdef double bv
-    with nogil:
-        for i in range(N):
-            bv = 0.0
-            for fi in range(n_pair):
-                bv += X_ptr[sample_indices[i] + <Py_ssize_t>best_pair[fi] * full_N] * best_x[fi]
-            sort_buffer[i].value = bv
-            sort_buffer[i].index = sample_indices[i]
-        sort_pointer_array(sort_buffer, N)
-
-    free(pair_idx); free(losses); free(weights)
-    free_workspaces(ws, n_threads)
+    best_x, best_pair = _analyze_from_pairs_compact(
+        task,
+        n_classes,
+        linear,
+        X,
+        y_sub,
+        sw_sub,
+        sum_sw,
+        sample_indices,
+        sort_buffer,
+        n_samples,
+        n_pair,
+        pair_idx,
+        n_fp,
+        rng,
+        gamma,
+        maxiter,
+        relative_change,
+    )
+    free(pair_idx)
     return best_x, best_pair
+
+
+cdef tuple[double*, int*] analyze_from_pairs(
+                const bint task,
+                const int n_classes,
+                const bint linear,
+                np.ndarray[double, ndim=2] X,
+                np.ndarray[double, ndim=1] y,
+                np.ndarray[double, ndim=1] sample_weight,
+                const int* sample_indices,
+                SortItem* sort_buffer,
+                const int n_samples,
+                const int n_pair,
+                const int* pair_idx,
+                const Py_ssize_t n_fp,
+                object rng,
+                const double gamma,
+                const int maxiter,
+                const double relative_change,
+              ) noexcept:
+    cdef np.ndarray[int, ndim=1] sample_dx
+    cdef np.ndarray[double, ndim=1] y_sub
+    cdef np.ndarray[double, ndim=1] sw_sub
+    cdef double sum_sw
+
+    sample_dx = np.frombuffer(
+        <bytes>(<char*>sample_indices)[:n_samples * sizeof(int)], dtype=np.int32)
+    y_sub = y[sample_dx].copy()
+    sw_sub = sample_weight[sample_dx].copy()
+    sum_sw = sw_sub.sum()
+
+    return _analyze_from_pairs_compact(
+        task,
+        n_classes,
+        linear,
+        X,
+        y_sub,
+        sw_sub,
+        sum_sw,
+        sample_indices,
+        sort_buffer,
+        n_samples,
+        n_pair,
+        pair_idx,
+        n_fp,
+        rng,
+        gamma,
+        maxiter,
+        relative_change,
+    )
+
+
+cdef void analyze_both_from_pairs(
+                const bint task,
+                const int n_classes,
+                np.ndarray[double, ndim=2] X,
+                np.ndarray[double, ndim=1] y,
+                np.ndarray[double, ndim=1] sample_weight,
+                const int* sample_indices,
+                SortItem* sort_buffer,
+                const int n_samples,
+                const int n_pair,
+                const int* pair_idx,
+                const Py_ssize_t n_fp,
+                object rng,
+                const double gamma,
+                const int maxiter,
+                const double relative_change,
+                double** out_oblique_x,
+                int** out_oblique_pair,
+                double** out_linear_x,
+                int** out_linear_pair,
+              ) noexcept:
+    cdef np.ndarray[int, ndim=1] sample_dx
+    cdef np.ndarray[double, ndim=1] y_sub
+    cdef np.ndarray[double, ndim=1] sw_sub
+    cdef double sum_sw
+    cdef double* oblique_x = NULL
+    cdef int* oblique_pair = NULL
+    cdef double* linear_x = NULL
+    cdef int* linear_pair = NULL
+
+    out_oblique_x[0] = NULL
+    out_oblique_pair[0] = NULL
+    out_linear_x[0] = NULL
+    out_linear_pair[0] = NULL
+
+    sample_dx = np.frombuffer(
+        <bytes>(<char*>sample_indices)[:n_samples * sizeof(int)], dtype=np.int32)
+    y_sub = y[sample_dx].copy()
+    sw_sub = sample_weight[sample_dx].copy()
+    sum_sw = sw_sub.sum()
+
+    oblique_x, oblique_pair = _analyze_from_pairs_compact(
+        task,
+        n_classes,
+        False,
+        X,
+        y_sub,
+        sw_sub,
+        sum_sw,
+        sample_indices,
+        sort_buffer,
+        n_samples,
+        n_pair,
+        pair_idx,
+        n_fp,
+        rng,
+        gamma,
+        maxiter,
+        relative_change,
+    )
+    linear_x, linear_pair = _analyze_from_pairs_compact(
+        task,
+        n_classes,
+        True,
+        X,
+        y_sub,
+        sw_sub,
+        sum_sw,
+        sample_indices,
+        sort_buffer,
+        n_samples,
+        n_pair,
+        pair_idx,
+        n_fp,
+        rng,
+        gamma,
+        maxiter,
+        relative_change,
+    )
+    out_oblique_x[0] = oblique_x
+    out_oblique_pair[0] = oblique_pair
+    out_linear_x[0] = linear_x
+    out_linear_pair[0] = linear_pair

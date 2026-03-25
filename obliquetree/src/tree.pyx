@@ -11,7 +11,7 @@ from .metric cimport (
     calculate_node_value,
     calculate_node_value_multiclass,
 )
-from .oblique cimport analyze
+from .oblique cimport analyze_both_from_pairs, prepare_candidate_pairs
 from .utils cimport sort_pointer_array, sort_pointer_array_count
 
 DEF COUNT_SORT_RANGE_FACTOR = 8
@@ -372,6 +372,7 @@ cdef TreeNode* build_tree_recursive(
     cdef int* best_oblique_pair = NULL
     cdef int* oblique_pair = NULL
     cdef int* linear_pair = NULL
+    cdef int* oblique_candidates = NULL
     cdef int** feature_categories = NULL
     cdef int* feature_category_counts = NULL
     cdef int* feature_left_counts = NULL
@@ -389,6 +390,7 @@ cdef TreeNode* build_tree_recursive(
     cdef bint missing_go_left = True
     cdef bint best_missing_go_left = True
     cdef bint use_feature_threads
+    cdef Py_ssize_t n_oblique_candidates = 0
     cdef double best_threshold = 0.0
     cdef long long feature_work
 
@@ -443,98 +445,89 @@ cdef TreeNode* build_tree_recursive(
 
     if use_oblique:
         with gil:
-            oblique_x, oblique_pair = analyze(
+            oblique_candidates = prepare_candidate_pairs(
                 task,
                 n_classes,
-                False,
                 X.base,
                 y.base,
                 sample_weight.base,
                 sample_indices,
-                sort_buffer,
                 n_samples,
                 n_pair,
                 is_categorical,
-                rng,
-                gamma,
-                max_iter,
-                relative_change,
+                &n_oblique_candidates,
             )
+        impurity_c = INFINITY
+        linear_impurity = INFINITY
 
-        impurity_c = calculate_impurity(
-            False,
-            n_classes,
-            sort_buffer,
-            &sample_weight[0],
-            &y[0],
-            nan_indices,
-            categorical_stats,
-            n_samples,
-            0,
-            min_samples_leaf,
-            &threshold_c,
-            &left_count_c,
-            &missing_go_left,
-            task,
-        )
+        if oblique_candidates != NULL and n_oblique_candidates > 0:
+            with gil:
+                oblique_x, oblique_pair, linear_x, linear_pair = analyze_both_from_pairs(
+                    task,
+                    n_classes,
+                    X.base,
+                    y.base,
+                    sample_weight.base,
+                    sample_indices,
+                    sort_buffer,
+                    n_samples,
+                    n_pair,
+                    oblique_candidates,
+                    n_oblique_candidates,
+                    rng,
+                    gamma,
+                    max_iter,
+                    relative_change,
+                )
 
-        with gil:
-            linear_x, linear_pair = analyze(
-                task,
-                n_classes,
-                True,
-                X.base,
-                y.base,
-                sample_weight.base,
-                sample_indices,
-                sort_buffer,
-                n_samples,
-                n_pair,
-                is_categorical,
-                rng,
-                gamma,
-                max_iter,
-                relative_change,
-            )
+            if oblique_x != NULL and oblique_pair != NULL:
+                impurity_c = calculate_impurity(
+                    False,
+                    n_classes,
+                    sort_buffer,
+                    &sample_weight[0],
+                    &y[0],
+                    nan_indices,
+                    categorical_stats,
+                    n_samples,
+                    0,
+                    min_samples_leaf,
+                    &threshold_c,
+                    &left_count_c,
+                    &missing_go_left,
+                    task,
+                )
 
-        if linear_x != NULL and linear_pair != NULL:
-            linear_impurity = calculate_impurity(
-                False,
-                n_classes,
-                sort_buffer,
-                &sample_weight[0],
-                &y[0],
-                nan_indices,
-                categorical_stats,
-                n_samples,
-                0,
-                min_samples_leaf,
-                &best_threshold,
-                &best_left_count,
-                &best_missing_go_left,
-                task,
-            )
+            if linear_x != NULL and linear_pair != NULL:
+                linear_impurity = calculate_impurity(
+                    False,
+                    n_classes,
+                    sort_buffer,
+                    &sample_weight[0],
+                    &y[0],
+                    nan_indices,
+                    categorical_stats,
+                    n_samples,
+                    0,
+                    min_samples_leaf,
+                    &best_threshold,
+                    &best_left_count,
+                    &best_missing_go_left,
+                    task,
+                )
 
-            if linear_impurity < impurity_c:
-                free_oblique_split(&oblique_x, &oblique_pair)
-                best_oblique_x = linear_x
-                best_oblique_pair = linear_pair
-                linear_x = NULL
-                linear_pair = NULL
-                min_impurity = linear_impurity
-            else:
-                free_oblique_split(&linear_x, &linear_pair)
-                best_oblique_x = oblique_x
-                best_oblique_pair = oblique_pair
-                oblique_x = NULL
-                oblique_pair = NULL
-                min_impurity = impurity_c
-                best_threshold = threshold_c
-                best_left_count = left_count_c
-                best_missing_go_left = missing_go_left
+        free(oblique_candidates)
+        oblique_candidates = NULL
 
+        if linear_impurity < impurity_c:
+            free_oblique_split(&oblique_x, &oblique_pair)
+            best_oblique_x = linear_x
+            best_oblique_pair = linear_pair
+            linear_x = NULL
+            linear_pair = NULL
+            min_impurity = linear_impurity
             best_feature = -2
-        else:
+        elif oblique_x != NULL and oblique_pair != NULL:
             free_oblique_split(&linear_x, &linear_pair)
             best_oblique_x = oblique_x
             best_oblique_pair = oblique_pair
@@ -545,6 +538,9 @@ cdef TreeNode* build_tree_recursive(
             best_left_count = left_count_c
             best_missing_go_left = missing_go_left
             best_feature = -2
+        else:
+            free_oblique_split(&linear_x, &linear_pair)
+            free_oblique_split(&oblique_x, &oblique_pair)
 
     feature_thresholds = <double*>malloc(n_features * sizeof(double))
     feature_impurities = <double*>malloc(n_features * sizeof(double))
