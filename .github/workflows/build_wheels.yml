@@ -40,6 +40,6 @@ jobs:
           CIBW_SKIP: "*-win32 *-manylinux_i686 *-musllinux_i686"
           CIBW_ARCHS: ${{ matrix.cibw_archs }}
           CIBW_BEFORE_BUILD_MACOS: brew install libomp
-          CIBW_ENVIRONMENT_MACOS: LIBOMP_PREFIX=$(brew --prefix libomp)
+          CIBW_ENVIRONMENT_MACOS: LIBOMP_PREFIX=$(brew --prefix libomp) MACOSX_DEPLOYMENT_TARGET=15.0
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
