@@ -4,7 +4,6 @@ version = "1.0.7"
 
 dependencies = [
     "numpy>=2.2.1",
-    "scipy>=1.15.0"
 ]
 authors = [
     { name = "Samet Copur", email = "sametcopur@yahoo.com" },
