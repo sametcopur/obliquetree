@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from .src.base import TreeClassifier
 
 from typing import List, Optional
