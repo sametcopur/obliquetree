@@ -1,6 +1,6 @@
 [project]
 name = "obliquetree"
-version = "1.0.6"
+version = "1.0.7"
 
 dependencies = [
     "numpy>=2.2.1",
