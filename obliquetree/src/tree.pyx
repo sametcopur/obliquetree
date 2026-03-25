@@ -719,6 +719,53 @@ cdef TreeNode* build_tree_recursive(
     return node
 
 
+cdef void _apply_single(
+    const TreeNode* node,
+    const double[::1, :] X,
+    const int sample_idx,
+    int node_id,
+    int* out,
+) noexcept nogil:
+    if node.is_leaf:
+        out[0] = node_id
+        return
+
+    if sample_goes_left(
+        X,
+        sample_idx,
+        node.feature_idx,
+        node.threshold,
+        node.missing_go_left,
+        node.n_pair,
+        node.x,
+        node.pair,
+        node.n_category,
+        node.categories_go_left,
+    ):
+        _apply_single(node.left, X, sample_idx, node_id + 1, out)
+    else:
+        _apply_single(node.right, X, sample_idx, node_id + 1 + _count_nodes(node.left), out)
+
+
+cdef int _count_nodes(const TreeNode* node) noexcept nogil:
+    if node == NULL:
+        return 0
+    if node.is_leaf:
+        return 1
+    return 1 + _count_nodes(node.left) + _count_nodes(node.right)
+
+
+cdef void apply(
+    const TreeNode* node,
+    const double[::1, :] X,
+    int[::1] out,
+    const int n_samples,
+) noexcept nogil:
+    cdef int i
+    for i in range(n_samples):
+        _apply_single(node, X, i, 0, &out[i])
+
+
 cdef void predict(
     const TreeNode* node,
     const double[::1, :] X,

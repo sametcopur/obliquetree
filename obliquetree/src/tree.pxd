@@ -34,6 +34,13 @@ cdef void predict(
     const int n_classes,
 ) noexcept nogil
 
+cdef void apply(
+    const TreeNode* node,
+    const double[::1, :] X,
+    int[::1] out,
+    const int n_samples,
+) noexcept nogil
+
 cdef TreeNode* build_tree_recursive(
     const bint task,
     const int n_classes,

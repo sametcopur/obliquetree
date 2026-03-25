@@ -2,7 +2,7 @@ from libc.stdlib cimport malloc, free, calloc
 import numpy as np
 cimport numpy as np
 
-from .tree cimport build_tree_recursive, predict, SortItem, CategoryStat
+from .tree cimport build_tree_recursive, predict, apply, SortItem, CategoryStat
 from .ccp cimport prune_tree
 from .utils cimport analyze_X, export_tree, deserialize_tree
 
@@ -216,6 +216,21 @@ cdef class TreeClassifier:
                 free(categorical_stats)
     
         return self
+
+    cpdef apply(self, double[::1, :] X):
+        cdef int n_samples = X.shape[0]
+        cdef int n_features = X.shape[1]
+        cdef np.ndarray[int, ndim=1] out
+
+        if self.root == NULL:
+            raise ValueError("The model has not been fitted yet. Call the 'fit' method before using this model.")
+
+        if self.n_features != n_features:
+            raise ValueError(f"Mismatch in number of features: expected {self.n_features}, but got {n_features}.")
+
+        out = np.empty(n_samples, dtype=np.intc)
+        apply(self.root, X, out, n_samples)
+        return out
 
     cpdef predict(self, double[::1, :] X):
         """

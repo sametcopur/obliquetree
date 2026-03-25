@@ -22,4 +22,5 @@ cdef class TreeClassifier:
     cdef public int n_features
 
     cpdef fit(self, double[::1, :] X, double[::1] y, double[::1] sample_weight)
+    cpdef apply(self, double[::1, :] X)
     cpdef predict(self, double[::1, :] X)

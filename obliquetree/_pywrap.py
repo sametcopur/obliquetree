@@ -457,6 +457,45 @@ class BaseTree(TreeClassifier):
                 "Consider reducing `n_pair` or the number of features."
             )
 
+    def apply(self, X: ArrayLike) -> NDArray:
+        """
+        Return the index of the leaf that each sample is predicted as.
+
+        Nodes are numbered using pre-order (depth-first) traversal, consistent
+        with scikit-learn's ``DecisionTreeClassifier.apply``.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            The input samples.
+
+        Returns
+        -------
+        X_leaves : NDArray of shape (n_samples,)
+            For each datapoint x in X, return the index of the leaf x
+            ends up in. Indices are in ``[0, n_nodes)``.
+
+        Raises
+        ------
+        ValueError
+            If the model has not been fitted yet.
+        """
+        if not self._fit:
+            raise ValueError(
+                "The model has not been fitted yet. Please call `fit` first."
+            )
+
+        X = np.asarray(X, order="F", dtype=np.float64)
+
+        if X.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D array for input samples, but got an array with {X.ndim} dimensions. "
+            )
+
+        self._validate_categories_in_data(X, is_fit=False)
+
+        return super().apply(X)
+
     def predict(self, X: ArrayLike) -> NDArray:
         """
         Predict target values for the input samples.
@@ -622,6 +661,24 @@ class Classifier(BaseTree):
         """
         return np.argmax(super().predict(X), axis=1)
 
+    def apply(self, X: ArrayLike) -> NDArray:
+        """
+        Return the index of the leaf that each sample ends up in.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            The input samples.
+
+        Returns
+        -------
+        X_leaves : NDArray of shape (n_samples,)
+            For each datapoint x in X, return the index of the leaf x
+            ends up in. Nodes are numbered using pre-order (depth-first)
+            traversal.
+        """
+        return super().apply(X)
+
     def predict_proba(self, X: ArrayLike) -> NDArray:
         """
         Predict class probabilities for X.
@@ -767,3 +824,21 @@ class Regressor(BaseTree):
             The predicted values.
         """
         return super().predict(X).ravel()
+
+    def apply(self, X: ArrayLike) -> NDArray:
+        """
+        Return the index of the leaf that each sample ends up in.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            The input samples.
+
+        Returns
+        -------
+        X_leaves : NDArray of shape (n_samples,)
+            For each datapoint x in X, return the index of the leaf x
+            ends up in. Nodes are numbered using pre-order (depth-first)
+            traversal.
+        """
+        return super().apply(X)
