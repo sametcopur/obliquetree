@@ -13,6 +13,7 @@ from .utils cimport sort_pointer_array
 DEF MIN_SCREEN_PAIRS = 64
 DEF MIN_SCREEN_SURVIVORS = 4
 DEF SCREEN_KEEP_DIVISOR = 5
+DEF MAX_SCREEN_SAMPLES = 2048
 
 
 # ---------------------------------------------------------------------------
@@ -653,28 +654,40 @@ cdef bint _check_ws(ThreadWorkspace* w, bint task_, bint linear,
             return w.buf1 != NULL and w.buf2 != NULL and w.buf3 != NULL
 
 
-cdef ThreadWorkspace* alloc_workspaces(
+cdef ThreadWorkspace* alloc_workspaces_shared(
     int n_threads, Py_ssize_t N, Py_ssize_t d,
-    int lbfgs_m, int n_classes, bint task_, bint linear) noexcept:
+    int lbfgs_m, int n_classes, bint task_) noexcept:
     cdef ThreadWorkspace* ws = <ThreadWorkspace*>calloc(
         n_threads, sizeof(ThreadWorkspace))
-    if ws == NULL:
-        return NULL
+    cdef Py_ssize_t buf12_size = N
+    cdef Py_ssize_t buf5_size = N
+    cdef Py_ssize_t d_size = d if d > 0 else 1
+    cdef Py_ssize_t cls_size = n_classes if n_classes > 0 else 1
     cdef int t
 
+    if ws == NULL:
+        return NULL
+
+    if d_size > buf12_size:
+        buf12_size = d_size
+    if cls_size > buf12_size:
+        buf12_size = cls_size
+    if cls_size > buf5_size:
+        buf5_size = cls_size
+
     for t in range(n_threads):
-        ws[t].grad      = <double*>malloc(d * sizeof(double))
-        ws[t].grad_new  = <double*>malloc(d * sizeof(double))
-        ws[t].direction = <double*>malloc(d * sizeof(double))
-        ws[t].x_new     = <double*>malloc(d * sizeof(double))
-        ws[t].s_hist    = <double*>calloc(lbfgs_m * d, sizeof(double))
-        ws[t].y_hist    = <double*>calloc(lbfgs_m * d, sizeof(double))
+        ws[t].grad      = <double*>malloc(d_size * sizeof(double))
+        ws[t].grad_new  = <double*>malloc(d_size * sizeof(double))
+        ws[t].direction = <double*>malloc(d_size * sizeof(double))
+        ws[t].x_new     = <double*>malloc(d_size * sizeof(double))
+        ws[t].s_hist    = <double*>calloc(lbfgs_m * d_size, sizeof(double))
+        ws[t].y_hist    = <double*>calloc(lbfgs_m * d_size, sizeof(double))
         ws[t].rho       = <double*>calloc(lbfgs_m, sizeof(double))
         ws[t].alpha_buf = <double*>malloc(lbfgs_m * sizeof(double))
-        ws[t].x_work    = <double*>malloc(d * sizeof(double))
-        ws[t].X_pair    = <double*>malloc(N * d * sizeof(double))
-        ws[t].pair_best_weights = <double*>malloc(d * sizeof(double))
-        ws[t].best_weights = <double*>malloc(d * sizeof(double))
+        ws[t].x_work    = <double*>malloc(d_size * sizeof(double))
+        ws[t].X_pair    = <double*>malloc(N * d_size * sizeof(double))
+        ws[t].pair_best_weights = <double*>malloc(d_size * sizeof(double))
+        ws[t].best_weights = <double*>malloc(d_size * sizeof(double))
         ws[t].best_loss = INFINITY
         ws[t].best_pi   = 0
 
@@ -683,40 +696,21 @@ cdef ThreadWorkspace* alloc_workspaces(
         ws[t].buf_dp_dz = <double*>malloc(N * sizeof(double))
 
         if task_ == 0:
-            if linear:
-                ws[t].buf1 = <double*>malloc(N * sizeof(double))
-                ws[t].buf2 = <double*>malloc(N * sizeof(double))
-                ws[t].buf3 = NULL; ws[t].buf4 = NULL
-                ws[t].buf5 = NULL; ws[t].buf6 = NULL; ws[t].buf7 = NULL
-            elif n_classes > 2:
-                ws[t].buf1 = <double*>malloc(n_classes * sizeof(double))
-                ws[t].buf2 = <double*>malloc(n_classes * sizeof(double))
-                ws[t].buf3 = <double*>malloc(d * sizeof(double))
-                ws[t].buf4 = <double*>malloc(d * sizeof(double))
-                ws[t].buf5 = <double*>calloc(n_classes, sizeof(double))
-                ws[t].buf6 = <double*>calloc(n_classes, sizeof(double))
-                ws[t].buf7 = NULL
-            else:
-                ws[t].buf1 = <double*>malloc(d * sizeof(double))
-                ws[t].buf2 = <double*>malloc(d * sizeof(double))
-                ws[t].buf3 = <double*>malloc(d * sizeof(double))
-                ws[t].buf4 = <double*>malloc(d * sizeof(double))
-                ws[t].buf5 = <double*>malloc(N * sizeof(double))
-                ws[t].buf6 = NULL; ws[t].buf7 = NULL
+            ws[t].buf1 = <double*>malloc(buf12_size * sizeof(double))
+            ws[t].buf2 = <double*>malloc(buf12_size * sizeof(double))
+            ws[t].buf3 = <double*>malloc(d_size * sizeof(double))
+            ws[t].buf4 = <double*>malloc(d_size * sizeof(double))
+            ws[t].buf5 = <double*>malloc(buf5_size * sizeof(double))
+            ws[t].buf6 = <double*>malloc(cls_size * sizeof(double))
+            ws[t].buf7 = NULL
         else:
-            if linear:
-                ws[t].buf1 = <double*>malloc(N * sizeof(double))
-                ws[t].buf2 = <double*>malloc(N * sizeof(double))
-                ws[t].buf3 = NULL; ws[t].buf4 = NULL
-                ws[t].buf5 = NULL; ws[t].buf6 = NULL; ws[t].buf7 = NULL
-            else:
-                ws[t].buf1 = <double*>malloc(N * sizeof(double))
-                ws[t].buf2 = <double*>malloc(N * sizeof(double))
-                ws[t].buf3 = <double*>malloc(d * sizeof(double))
-                ws[t].buf4 = NULL; ws[t].buf5 = NULL
-                ws[t].buf6 = NULL; ws[t].buf7 = NULL
+            ws[t].buf1 = <double*>malloc(N * sizeof(double))
+            ws[t].buf2 = <double*>malloc(N * sizeof(double))
+            ws[t].buf3 = <double*>malloc(d_size * sizeof(double))
+            ws[t].buf4 = NULL; ws[t].buf5 = NULL
+            ws[t].buf6 = NULL; ws[t].buf7 = NULL
 
-        if not _check_ws(&ws[t], task_, linear, n_classes):
+        if not _check_ws(&ws[t], task_, False, n_classes):
             free_workspaces(ws, n_threads)
             return NULL
     return ws
@@ -1007,6 +1001,28 @@ cdef void fill_oblique_sort_buffer(
         sort_pointer_array(sort_buffer, N)
 
 
+cdef inline void fill_oblique_sort_buffer_ptr(
+                const double* X_ptr,
+                const Py_ssize_t full_N,
+                const int* sample_indices,
+                SortItem* sort_buffer,
+                const int n_samples,
+                const int n_pair,
+                const int* pair_idx,
+                const double* x) noexcept nogil:
+    cdef Py_ssize_t N = n_samples
+    cdef Py_ssize_t i, fi
+    cdef double bv
+
+    for i in range(N):
+        bv = 0.0
+        for fi in range(n_pair):
+            bv += X_ptr[sample_indices[i] + <Py_ssize_t>pair_idx[fi] * full_N] * x[fi]
+        sort_buffer[i].value = bv
+        sort_buffer[i].index = sample_indices[i]
+    sort_pointer_array(sort_buffer, N)
+
+
 # ---------------------------------------------------------------------------
 # analyze()
 # ---------------------------------------------------------------------------
@@ -1112,7 +1128,8 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
                 const bint task,
                 const int n_classes,
                 const bint linear,
-                np.ndarray[double, ndim=2] X,
+                const double* X_ptr,
+                const Py_ssize_t full_N,
                 np.ndarray[double, ndim=1] y_sub,
                 np.ndarray[double, ndim=1] sw_sub,
                 const double sum_sw,
@@ -1122,24 +1139,27 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
                 const int n_pair,
                 const int* pair_idx,
                 const Py_ssize_t n_fp,
-                object rng,
+                const unsigned long long rng_seed,
+                ThreadWorkspace* ws,
+                const int n_threads,
+                const int lbfgs_m,
+                const bint write_sort_buffer,
                 const double gamma,
                 const int maxiter,
                 const double relative_change,
               ) noexcept:
     cdef Py_ssize_t N = n_samples
-    cdef Py_ssize_t full_N = X.shape[0]
     cdef Py_ssize_t i
     cdef int* best_pair = NULL
     cdef double* best_x = NULL
     cdef double best_fx = INFINITY
-    cdef double* X_ptr
     cdef double* y_ptr
     cdef double* sw_ptr
-    cdef unsigned long long rng_seed
-    cdef int n_threads = openmp.omp_get_max_threads()
-    cdef int lbfgs_m = 10
-    cdef ThreadWorkspace* ws = NULL
+    cdef const int* screen_sample_indices = sample_indices
+    cdef double* y_screen_ptr
+    cdef double* sw_screen_ptr
+    cdef Py_ssize_t screen_N = N
+    cdef double screen_sum_sw
     cdef int t
     cdef Py_ssize_t pi, fi
     cdef int tid, ci
@@ -1157,7 +1177,13 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
     cdef Py_ssize_t si, real_pi
     cdef Py_ssize_t best_job = 0
     cdef double max_abs = 0.0
-    cdef double bv
+    cdef np.ndarray[int, ndim=1] screen_sample_idx_arr
+    cdef np.ndarray[double, ndim=1] y_screen_arr
+    cdef np.ndarray[double, ndim=1] sw_screen_arr
+    cdef int* screen_sample_idx_ptr = NULL
+    cdef double* y_screen_arr_ptr = NULL
+    cdef double* sw_screen_arr_ptr = NULL
+    cdef Py_ssize_t screen_src_i
 
     if pair_idx == NULL or n_fp <= 0:
         return NULL, NULL
@@ -1168,19 +1194,12 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
         free(best_pair); free(best_x)
         return NULL, NULL
 
-    # Ensure X is Fortran-order
-    if not X.flags['F_CONTIGUOUS']:
-        X = np.asfortranarray(X)
-    X_ptr = <double*>np.PyArray_DATA(X)
     y_ptr = <double*>np.PyArray_DATA(y_sub)
     sw_ptr = <double*>np.PyArray_DATA(sw_sub)
+    y_screen_ptr = y_ptr
+    sw_screen_ptr = sw_ptr
+    screen_sum_sw = sum_sw
 
-    # Derive deterministic seed from rng
-    rng_seed = <unsigned long long>rng.integers(0, 2**63)
-
-    # Workspaces
-    ws = alloc_workspaces(
-        n_threads, N, n_pair, lbfgs_m, n_classes, task, linear)
     if ws == NULL:
         free(best_pair); free(best_x)
         return NULL, NULL
@@ -1193,6 +1212,27 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
     # ===================================================================
     # Skip screening when top-k has already reduced the pair set enough.
     do_screen = n_fp >= MIN_SCREEN_PAIRS
+
+    if do_screen and N > MAX_SCREEN_SAMPLES:
+        screen_N = MAX_SCREEN_SAMPLES
+        screen_sample_idx_arr = np.empty(screen_N, dtype=np.int32)
+        y_screen_arr = np.empty(screen_N, dtype=np.float64)
+        sw_screen_arr = np.empty(screen_N, dtype=np.float64)
+        screen_sample_idx_ptr = <int*>np.PyArray_DATA(screen_sample_idx_arr)
+        y_screen_arr_ptr = <double*>np.PyArray_DATA(y_screen_arr)
+        sw_screen_arr_ptr = <double*>np.PyArray_DATA(sw_screen_arr)
+        screen_sum_sw = 0.0
+        for i in range(screen_N):
+            screen_src_i = ((2 * i + 1) * N) // (2 * screen_N)
+            if screen_src_i >= N:
+                screen_src_i = N - 1
+            screen_sample_idx_ptr[i] = sample_indices[screen_src_i]
+            y_screen_arr_ptr[i] = y_ptr[screen_src_i]
+            sw_screen_arr_ptr[i] = sw_ptr[screen_src_i]
+            screen_sum_sw += sw_screen_arr_ptr[i]
+        screen_sample_indices = screen_sample_idx_ptr
+        y_screen_ptr = y_screen_arr_ptr
+        sw_screen_ptr = sw_screen_arr_ptr
 
     if do_screen:
         screen_losses = <double*>malloc(n_fp * sizeof(double))
@@ -1209,7 +1249,7 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
             tid = openmp.omp_get_thread_num()
             w = &ws[tid]
 
-            gather_X_pair(X_ptr, full_N, sample_indices, N,
+            gather_X_pair(X_ptr, full_N, screen_sample_indices, screen_N,
                           &pair_idx[pi * n_pair], n_pair, w.X_pair)
             init_x0_deterministic(w.x_work, n_pair, rng_seed, pi)
             memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
@@ -1221,8 +1261,8 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
                 memset(w.rho, 0, lbfgs_m * sizeof(double))
                 f_val = proxy_screen_nogil(
                     task, n_classes, <double>ci, linear,
-                    w.x_work, w.X_pair, y_ptr, sw_ptr, sum_sw,
-                    N, n_pair, gamma, 1e-6, 1e-5,
+                    w.x_work, w.X_pair, y_screen_ptr, sw_screen_ptr, screen_sum_sw,
+                    screen_N, n_pair, gamma, 1e-6, 1e-5,
                     w.grad, w.grad_new, w.x_new,
                     w.buf_z, w.buf_p, w.buf_dp_dz,
                     w.buf1, w.buf2, w.buf3,
@@ -1349,9 +1389,18 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
         best_pair[i] = pair_idx[best_job * n_pair + i]
         best_x[i] = best_x[i] / max_abs
 
-    fill_oblique_sort_buffer(X, sample_indices, sort_buffer, n_samples, n_pair, best_pair, best_x)
-
-    free_workspaces(ws, n_threads)
+    if write_sort_buffer:
+        with nogil:
+            fill_oblique_sort_buffer_ptr(
+                X_ptr,
+                full_N,
+                sample_indices,
+                sort_buffer,
+                n_samples,
+                n_pair,
+                best_pair,
+                best_x,
+            )
     return best_x, best_pair
 
 
@@ -1380,6 +1429,12 @@ cdef tuple[double*, int*] analyze(
     cdef np.ndarray[double, ndim=1] y_sub
     cdef np.ndarray[double, ndim=1] sw_sub
     cdef double sum_sw
+    cdef double* X_ptr
+    cdef Py_ssize_t full_N
+    cdef unsigned long long rng_seed
+    cdef int n_threads
+    cdef int lbfgs_m = 10
+    cdef ThreadWorkspace* ws = NULL
     pair_idx = prepare_candidate_pairs(
         task,
         n_classes,
@@ -1401,12 +1456,23 @@ cdef tuple[double*, int*] analyze(
     y_sub = y[sample_dx].copy()
     sw_sub = sample_weight[sample_dx].copy()
     sum_sw = sw_sub.sum()
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    X_ptr = <double*>np.PyArray_DATA(X)
+    full_N = X.shape[0]
+    rng_seed = <unsigned long long>rng.integers(0, 2**63)
+    n_threads = openmp.omp_get_max_threads()
+    ws = alloc_workspaces_shared(n_threads, n_samples, n_pair, lbfgs_m, n_classes, task)
+    if ws == NULL:
+        free(pair_idx)
+        return NULL, NULL
 
     best_x, best_pair = _analyze_from_pairs_compact(
         task,
         n_classes,
         linear,
-        X,
+        X_ptr,
+        full_N,
         y_sub,
         sw_sub,
         sum_sw,
@@ -1416,11 +1482,16 @@ cdef tuple[double*, int*] analyze(
         n_pair,
         pair_idx,
         n_fp,
-        rng,
+        rng_seed,
+        ws,
+        n_threads,
+        lbfgs_m,
+        True,
         gamma,
         maxiter,
         relative_change,
     )
+    free_workspaces(ws, n_threads)
     free(pair_idx)
     return best_x, best_pair
 
@@ -1447,18 +1518,36 @@ cdef tuple[double*, int*] analyze_from_pairs(
     cdef np.ndarray[double, ndim=1] y_sub
     cdef np.ndarray[double, ndim=1] sw_sub
     cdef double sum_sw
+    cdef double* X_ptr
+    cdef Py_ssize_t full_N
+    cdef unsigned long long rng_seed
+    cdef int n_threads
+    cdef int lbfgs_m = 10
+    cdef ThreadWorkspace* ws = NULL
+    cdef double* best_x = NULL
+    cdef int* best_pair = NULL
 
     sample_dx = np.frombuffer(
         <bytes>(<char*>sample_indices)[:n_samples * sizeof(int)], dtype=np.int32)
     y_sub = y[sample_dx].copy()
     sw_sub = sample_weight[sample_dx].copy()
     sum_sw = sw_sub.sum()
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    X_ptr = <double*>np.PyArray_DATA(X)
+    full_N = X.shape[0]
+    rng_seed = <unsigned long long>rng.integers(0, 2**63)
+    n_threads = openmp.omp_get_max_threads()
+    ws = alloc_workspaces_shared(n_threads, n_samples, n_pair, lbfgs_m, n_classes, task)
+    if ws == NULL:
+        return NULL, NULL
 
-    return _analyze_from_pairs_compact(
+    best_x, best_pair = _analyze_from_pairs_compact(
         task,
         n_classes,
         linear,
-        X,
+        X_ptr,
+        full_N,
         y_sub,
         sw_sub,
         sum_sw,
@@ -1468,11 +1557,17 @@ cdef tuple[double*, int*] analyze_from_pairs(
         n_pair,
         pair_idx,
         n_fp,
-        rng,
+        rng_seed,
+        ws,
+        n_threads,
+        lbfgs_m,
+        True,
         gamma,
         maxiter,
         relative_change,
     )
+    free_workspaces(ws, n_threads)
+    return best_x, best_pair
 
 
 cdef void analyze_both_from_pairs(
@@ -1500,6 +1595,12 @@ cdef void analyze_both_from_pairs(
     cdef np.ndarray[double, ndim=1] y_sub
     cdef np.ndarray[double, ndim=1] sw_sub
     cdef double sum_sw
+    cdef double* X_ptr
+    cdef Py_ssize_t full_N
+    cdef unsigned long long rng_seed
+    cdef int n_threads
+    cdef int lbfgs_m = 10
+    cdef ThreadWorkspace* ws = NULL
     cdef double* oblique_x = NULL
     cdef int* oblique_pair = NULL
     cdef double* linear_x = NULL
@@ -1515,12 +1616,22 @@ cdef void analyze_both_from_pairs(
     y_sub = y[sample_dx].copy()
     sw_sub = sample_weight[sample_dx].copy()
     sum_sw = sw_sub.sum()
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    X_ptr = <double*>np.PyArray_DATA(X)
+    full_N = X.shape[0]
+    rng_seed = <unsigned long long>rng.integers(0, 2**63)
+    n_threads = openmp.omp_get_max_threads()
+    ws = alloc_workspaces_shared(n_threads, n_samples, n_pair, lbfgs_m, n_classes, task)
+    if ws == NULL:
+        return
 
     oblique_x, oblique_pair = _analyze_from_pairs_compact(
         task,
         n_classes,
         False,
-        X,
+        X_ptr,
+        full_N,
         y_sub,
         sw_sub,
         sum_sw,
@@ -1530,7 +1641,11 @@ cdef void analyze_both_from_pairs(
         n_pair,
         pair_idx,
         n_fp,
-        rng,
+        rng_seed,
+        ws,
+        n_threads,
+        lbfgs_m,
+        False,
         gamma,
         maxiter,
         relative_change,
@@ -1539,7 +1654,8 @@ cdef void analyze_both_from_pairs(
         task,
         n_classes,
         True,
-        X,
+        X_ptr,
+        full_N,
         y_sub,
         sw_sub,
         sum_sw,
@@ -1549,11 +1665,16 @@ cdef void analyze_both_from_pairs(
         n_pair,
         pair_idx,
         n_fp,
-        rng,
+        rng_seed ^ <unsigned long long>0x9e3779b97f4a7c15ULL,
+        ws,
+        n_threads,
+        lbfgs_m,
+        False,
         gamma,
         maxiter,
         relative_change,
     )
+    free_workspaces(ws, n_threads)
     out_oblique_x[0] = oblique_x
     out_oblique_pair[0] = oblique_pair
     out_linear_x[0] = linear_x
