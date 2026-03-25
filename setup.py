@@ -20,6 +20,7 @@ if sys.platform in ("win32", "linux", "darwin"):  # All platforms
             "/Oi",  # Enable intrinsic functions
             "/GT",  # Fiber-safe optimizations
             "/std:c++17",  # C++17 standard
+            "/openmp",  # OpenMP support
         ]
         extra_link_args = ["/OPT:REF", "/OPT:ICF"]
     else:  # linux and darwin (macOS)
@@ -48,8 +49,11 @@ if sys.platform in ("win32", "linux", "darwin"):  # All platforms
                     "-Wl,-rpath," + library_dirs[0],
                 ])
             else:
-                include_dirs_extra = []
-                library_dirs = []
+                raise RuntimeError(
+                    "OpenMP (libomp) is required but was not found. "
+                    "Install it via 'brew install libomp' or set the LIBOMP_PREFIX "
+                    "environment variable to the libomp installation path."
+                )
 
 define_macros = [("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
 include_dirs = [np.get_include(), *include_dirs_extra]
