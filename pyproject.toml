@@ -1,6 +1,6 @@
 [project]
 name = "obliquetree"
-version = "1.0.7"
+version = "1.1.0"
 
 dependencies = [
     "numpy>=2.2.1",
@@ -36,5 +36,5 @@ Tracker = "https://github.com/sametcopur/obliquetree/issues"
 build = "cp310-* cp311-* cp312-* cp313-*"
 
 [build-system]
-requires = ["setuptools", "wheel", "Cython>=3.1", "numpy>=2.2.1", "scipy>=1.15.0"]
+requires = ["setuptools", "wheel", "Cython>=3.1", "numpy>=2.2.1"]
 build-backend = "setuptools.build_meta"
