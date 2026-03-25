@@ -36,10 +36,13 @@ pip install obliquetree
 - **Exact Equivalence with `scikit-learn`**  
   Guarantees results identical to `scikit-learn`'s decision trees when oblique and categorical splitting are disabled.
 
-- **Optimized Performance**  
+- **Parallel Split Search**
+  Utilizes OpenMP-based parallelism during tree construction to evaluate splits in parallel across features, enabling significant speedups on multi-core systems.
+
+- **Optimized Performance**
   Outperforms `scikit-learn` in terms of speed and efficiency when oblique and categorical splitting are disabled:
-  - Up to **50% faster** for datasets with float columns.
-  - Up to **200% faster** for datasets with integer columns.
+  - Up to **600% faster** for datasets with float columns.
+  - Up to **400% faster** for datasets with integer columns.
 
   ![Performance Comparison (Float)](_static/sklearn_perf/performance_comparison_float.png)
 
