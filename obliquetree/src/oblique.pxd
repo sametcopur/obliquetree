@@ -13,6 +13,15 @@ cdef int* prepare_candidate_pairs(
                 const bint* is_categorical,
                 Py_ssize_t* out_n_fp) noexcept
 
+cdef void fill_oblique_sort_buffer(
+                np.ndarray[double, ndim=2] X,
+                const int* sample_indices,
+                SortItem* sort_buffer,
+                const int n_samples,
+                const int n_pair,
+                const int* pair_idx,
+                const double* x) noexcept
+
 cdef tuple[double*, int*] analyze_from_pairs(
                 const bint task,
                 const int n_classes,

@@ -11,7 +11,7 @@ from .metric cimport (
     calculate_node_value,
     calculate_node_value_multiclass,
 )
-from .oblique cimport analyze_both_from_pairs, prepare_candidate_pairs
+from .oblique cimport analyze_both_from_pairs, fill_oblique_sort_buffer, prepare_candidate_pairs
 from .utils cimport sort_pointer_array, sort_pointer_array_count
 
 DEF COUNT_SORT_RANGE_FACTOR = 8
@@ -462,7 +462,7 @@ cdef TreeNode* build_tree_recursive(
 
         if oblique_candidates != NULL and n_oblique_candidates > 0:
             with gil:
-                oblique_x, oblique_pair, linear_x, linear_pair = analyze_both_from_pairs(
+                analyze_both_from_pairs(
                     task,
                     n_classes,
                     X.base,
@@ -478,9 +478,23 @@ cdef TreeNode* build_tree_recursive(
                     gamma,
                     max_iter,
                     relative_change,
+                    &oblique_x,
+                    &oblique_pair,
+                    &linear_x,
+                    &linear_pair,
                 )
 
             if oblique_x != NULL and oblique_pair != NULL:
+                with gil:
+                    fill_oblique_sort_buffer(
+                        X.base,
+                        sample_indices,
+                        sort_buffer,
+                        n_samples,
+                        n_pair,
+                        oblique_pair,
+                        oblique_x,
+                    )
                 impurity_c = calculate_impurity(
                     False,
                     n_classes,
@@ -499,6 +513,16 @@ cdef TreeNode* build_tree_recursive(
                 )
 
             if linear_x != NULL and linear_pair != NULL:
+                with gil:
+                    fill_oblique_sort_buffer(
+                        X.base,
+                        sample_indices,
+                        sort_buffer,
+                        n_samples,
+                        n_pair,
+                        linear_pair,
+                        linear_x,
+                    )
                 linear_impurity = calculate_impurity(
                     False,
                     n_classes,

@@ -977,6 +977,37 @@ cdef void topk_indices(
 
 
 # ---------------------------------------------------------------------------
+# Projection helper
+# ---------------------------------------------------------------------------
+cdef void fill_oblique_sort_buffer(
+                np.ndarray[double, ndim=2] X,
+                const int* sample_indices,
+                SortItem* sort_buffer,
+                const int n_samples,
+                const int n_pair,
+                const int* pair_idx,
+                const double* x) noexcept:
+    cdef Py_ssize_t N = n_samples
+    cdef Py_ssize_t full_N = X.shape[0]
+    cdef Py_ssize_t i, fi
+    cdef double bv
+    cdef double* X_ptr
+
+    if not X.flags['F_CONTIGUOUS']:
+        X = np.asfortranarray(X)
+    X_ptr = <double*>np.PyArray_DATA(X)
+
+    with nogil:
+        for i in range(N):
+            bv = 0.0
+            for fi in range(n_pair):
+                bv += X_ptr[sample_indices[i] + <Py_ssize_t>pair_idx[fi] * full_N] * x[fi]
+            sort_buffer[i].value = bv
+            sort_buffer[i].index = sample_indices[i]
+        sort_pointer_array(sort_buffer, N)
+
+
+# ---------------------------------------------------------------------------
 # analyze()
 # ---------------------------------------------------------------------------
 cdef int* prepare_candidate_pairs(
@@ -1318,15 +1349,7 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
         best_pair[i] = pair_idx[best_job * n_pair + i]
         best_x[i] = best_x[i] / max_abs
 
-    # Compute projected values and sort
-    with nogil:
-        for i in range(N):
-            bv = 0.0
-            for fi in range(n_pair):
-                bv += X_ptr[sample_indices[i] + <Py_ssize_t>best_pair[fi] * full_N] * best_x[fi]
-            sort_buffer[i].value = bv
-            sort_buffer[i].index = sample_indices[i]
-        sort_pointer_array(sort_buffer, N)
+    fill_oblique_sort_buffer(X, sample_indices, sort_buffer, n_samples, n_pair, best_pair, best_x)
 
     free_workspaces(ws, n_threads)
     return best_x, best_pair
