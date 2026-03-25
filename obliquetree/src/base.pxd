@@ -9,6 +9,7 @@ cdef class TreeClassifier:
     cdef public double min_impurity_decrease
     cdef public int random_state
     cdef public int n_pair
+    cdef public int top_k
     cdef public object rng_
     cdef public double gamma
     cdef public int max_iter 

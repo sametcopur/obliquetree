@@ -47,6 +47,7 @@ cdef class TreeClassifier:
                         double min_impurity_decrease,  
                         int random_state, 
                         int n_pair, 
+                        int top_k,
                         double gamma,
                         int max_iter,
                         double relative_change,
@@ -60,6 +61,7 @@ cdef class TreeClassifier:
         self.min_impurity_decrease = min_impurity_decrease
         self.random_state = random_state
         self.n_pair = n_pair
+        self.top_k = top_k
         self.gamma = gamma
         self.max_iter = max_iter
         self.relative_change = relative_change
@@ -94,6 +96,7 @@ cdef class TreeClassifier:
         self.min_impurity_decrease = params.get('min_impurity_decrease', 0.0)
         self.random_state = params.get('random_state', 42)
         self.n_pair = params.get('n_pair', 2)
+        self.top_k = params.get('top_k', 0)
         self.gamma = params.get('gamma', 1.0)
         self.max_iter = params.get('max_iter', 100)
         self.relative_change = params.get('relative_change', 0.001)
@@ -177,6 +180,7 @@ cdef class TreeClassifier:
                 nan_indices,
                 n_samples,
                 self.n_pair,
+                self.top_k,
                 self.gamma,
                 self.max_iter, 
                 self.relative_change,

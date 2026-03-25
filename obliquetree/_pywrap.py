@@ -92,6 +92,7 @@ class BaseTree(TreeClassifier):
         use_oblique: bool,
         random_state: Optional[int],
         n_pair: int,
+        top_k: Optional[int],
         gamma: float,
         max_iter: int,
         relative_change: float,
@@ -107,6 +108,7 @@ class BaseTree(TreeClassifier):
         )
         self.ccp_alpha = self._validate_ccp_alpha(ccp_alpha)
         self.n_pair = self._validate_n_pair(n_pair)
+        self.top_k = self._validate_top_k(top_k, self.n_pair)
         self.gamma = self._validate_gamma(gamma)
         self.max_iter = self._validate_max_iter(max_iter)
         self.relative_change = self._validate_relative_change(
@@ -125,6 +127,7 @@ class BaseTree(TreeClassifier):
             self.min_impurity_decrease,
             self.random_state,
             self.n_pair,
+            self.top_k,
             self.gamma,
             self.max_iter,
             self.relative_change,
@@ -163,6 +166,7 @@ class BaseTree(TreeClassifier):
             f"categories={getattr(self, 'categories', None)}, "
             f"random_state={getattr(self, 'random_state', None)}, "
             f"n_pair={getattr(self, 'n_pair', None)}, "
+            f"top_k={getattr(self, 'top_k', None)}, "
             f"gamma={getattr(self, 'gamma', None)}, "
             f"max_iter={getattr(self, 'max_iter', None)}, "
             f"relative_change={getattr(self, 'relative_change', None)}"
@@ -210,6 +214,15 @@ class BaseTree(TreeClassifier):
         if n_pair < 2:
             raise ValueError("n_pair must be >= 2")
         return n_pair
+
+    def _validate_top_k(self, top_k: Optional[int], n_pair: int) -> int:
+        if top_k is None:
+            return 0
+        if not isinstance(top_k, int):
+            raise ValueError("top_k must be an integer or None")
+        if top_k < n_pair:
+            raise ValueError("top_k must be >= n_pair")
+        return top_k
 
     def _validate_gamma(self, gamma: float) -> float:
         if not isinstance(gamma, (int, float)):
@@ -539,6 +552,7 @@ class Classifier(BaseTree):
         categories: Optional[List[int]] = None,
         random_state: Optional[int] = None,
         n_pair: int = 2,
+        top_k: Optional[int] = None,
         gamma: float = 1.0,
         max_iter: int = 100,
         relative_change: float = 0.001,
@@ -587,6 +601,12 @@ class Classifier(BaseTree):
 
             - Only used when `use_oblique=True`.
 
+        top_k : int or None, default=None
+            Number of numeric features kept after cheap oblique feature screening.
+
+            - If `None`, an internal heuristic is used.
+            - Only used when `use_oblique=True`.
+
         gamma : float, default=1.0
             Separation strength parameter for oblique splits.
 
@@ -613,6 +633,7 @@ class Classifier(BaseTree):
             use_oblique=use_oblique,
             random_state=random_state,
             n_pair=n_pair,
+            top_k=top_k,
             gamma=gamma,
             max_iter=max_iter,
             relative_change=relative_change,
@@ -703,6 +724,7 @@ class Regressor(BaseTree):
         categories: Optional[List[int]] = None,
         random_state: Optional[int] = None,
         n_pair: int = 2,
+        top_k: Optional[int] = None,
         gamma: float = 1.0,
         max_iter: int = 100,
         relative_change: float = 0.001,
@@ -751,6 +773,12 @@ class Regressor(BaseTree):
 
             - Only used when `use_oblique=True`.
 
+        top_k : int or None, default=None
+            Number of numeric features kept after cheap oblique feature screening.
+
+            - If `None`, an internal heuristic is used.
+            - Only used when `use_oblique=True`.
+
         gamma : float, default=1.0
             Separation strength parameter for oblique splits.
 
@@ -777,6 +805,7 @@ class Regressor(BaseTree):
             use_oblique=use_oblique,
             random_state=random_state,
             n_pair=n_pair,
+            top_k=top_k,
             gamma=gamma,
             max_iter=max_iter,
             relative_change=relative_change,

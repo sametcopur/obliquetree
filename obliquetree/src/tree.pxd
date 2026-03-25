@@ -56,6 +56,7 @@ cdef TreeNode* build_tree_recursive(
     int* nan_indices,
     const int n_samples,
     const int n_pair,
+    const int top_k,
     const double gamma,
     const int max_iter,
     const double relative_change,

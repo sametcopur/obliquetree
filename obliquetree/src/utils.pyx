@@ -105,6 +105,7 @@ cpdef dict export_tree(TreeClassifier tree):
         'min_impurity_decrease': tree.min_impurity_decrease,
         'random_state': tree.random_state,
         'n_pair': tree.n_pair,
+        'top_k': tree.top_k,
         'gamma': tree.gamma,
         'max_iter': tree.max_iter,
         'relative_change': tree.relative_change,

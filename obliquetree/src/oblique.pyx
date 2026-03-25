@@ -11,7 +11,6 @@ cimport openmp
 from .utils cimport sort_pointer_array
 
 DEF MIN_SCREEN_PAIRS = 64
-DEF MIN_SCREEN_SURVIVORS = 4
 DEF SCREEN_KEEP_DIVISOR = 5
 DEF MAX_SCREEN_SAMPLES = 2048
 
@@ -278,7 +277,7 @@ cdef double fun_and_grad_reg_nogil(
     cdef double loss = 0.0
     cdef double S_L = 0.0, M_L = 0.0, S_R = 0.0, M_R = 0.0
     cdef double mL, mR, p_val, dp_val, sw_i, diffL, diffR
-    cdef double dS_L_w, dM_L_w, d_mL_w, d_mR_w
+    cdef double dS_L_w, dM_L_w, d_mL_w, d_mR_w, mean_grad_j
 
     for i in range(d):
         grad_w[i] = 0.0; temp_grad[i] = 0.0
@@ -317,16 +316,13 @@ cdef double fun_and_grad_reg_nogil(
         dM_L_w = temp_vec2[j]
         d_mL_w = (S_L * dM_L_w - M_L * dS_L_w) / (S_L * S_L)
         d_mR_w = (S_R * (-dM_L_w) - M_R * (-dS_L_w)) / (S_R * S_R)
+        mean_grad_j = 0.0
         for i in range(N):
             sw_i = sample_weight[i]
-            temp_vec1[i] = -2.0 * sw_i * (
+            mean_grad_j += -2.0 * sw_i * (
                 p[i] * (y[i] - mL) * d_mL_w +
                 (1.0 - p[i]) * (y[i] - mR) * d_mR_w)
-        for i in range(d):
-            temp_vec2[i] = 0.0
-        matvec_T(X, temp_vec1, temp_vec2, N, d, lda)
-        for i in range(d):
-            grad_w[i] += temp_vec2[i]
+        grad_w[j] += mean_grad_j
 
     for i in range(d):
         grad_w[i] /= total_weight
@@ -1047,6 +1043,7 @@ cdef int* prepare_candidate_pairs(
                 const int* sample_indices,
                 const int n_samples,
                 const int n_pair,
+                const int top_k,
                 const bint* is_categorical,
                 Py_ssize_t* out_n_fp,
               ) noexcept:
@@ -1096,9 +1093,14 @@ cdef int* prepare_candidate_pairs(
     for i in range(N):
         sum_sw += sw_ptr[sample_indices[i]]
 
-    k = <Py_ssize_t>sqrt(<double>n_usable)
-    if k < 2 * n_pair:
-        k = 2 * n_pair
+    if top_k > 0:
+        k = top_k
+    else:
+        k = <Py_ssize_t>sqrt(<double>n_usable)
+        if k < 2 * n_pair:
+            k = 2 * n_pair
+    if k < n_pair:
+        k = n_pair
     if k > n_usable:
         k = n_usable
 
@@ -1287,8 +1289,6 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
 
         # Keep only a small survivor set when screening is actually worthwhile.
         surv_target = n_fp // SCREEN_KEEP_DIVISOR
-        if surv_target < MIN_SCREEN_SURVIVORS:
-            surv_target = MIN_SCREEN_SURVIVORS
         if surv_target > n_fp:
             surv_target = n_fp
 
@@ -1427,6 +1427,7 @@ cdef tuple[double*, int*] analyze(
                 SortItem* sort_buffer,
                 const int n_samples,
                 const int n_pair,
+                const int top_k,
                 const bint* is_categorical,
                 object rng,
                 const double gamma,
@@ -1456,6 +1457,7 @@ cdef tuple[double*, int*] analyze(
         sample_indices,
         n_samples,
         n_pair,
+        top_k,
         is_categorical,
         &n_fp,
     )

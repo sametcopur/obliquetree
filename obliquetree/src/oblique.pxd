@@ -10,6 +10,7 @@ cdef int* prepare_candidate_pairs(
                 const int* sample_indices,
                 const int n_samples,
                 const int n_pair,
+                const int top_k,
                 const bint* is_categorical,
                 Py_ssize_t* out_n_fp) noexcept
 
@@ -71,7 +72,8 @@ cdef tuple[double*, int*] analyze(
                 const int* sample_indices,
                 SortItem* sort_buffer,
                 const int n_samples,
-                const int n_pair, 
+                const int n_pair,
+                const int top_k,
                 const bint* is_categorical,
                 object rng,
                 const double gamma, 
