@@ -64,6 +64,12 @@ class BaseTree(TreeClassifier):
 
         - Only used when `use_oblique=True`.
 
+    top_k : int or None
+        Number of numeric features kept after cheap oblique feature screening.
+
+        - If `None`, an internal heuristic is used.
+        - Only used when `use_oblique=True`.
+
     gamma : float
         Separation strength parameter for oblique splits.
 
