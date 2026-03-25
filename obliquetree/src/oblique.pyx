@@ -213,12 +213,21 @@ cdef double fun_and_grad_multiclass_nogil(
     double* class_counts_L, double* class_counts_R,
     double* tmp_dp_vec, double* dS_R_w,
     double* P_k_L, double* P_k_R) noexcept nogil:
+    """
+    Multiclass weighted Gini oblique split loss + gradient.
 
-    cdef Py_ssize_t i, k, lda = N
+    L = S_L * Gini_L + S_R * Gini_R
+    where Gini_X = sum_k P_X,k * (1 - P_X,k)
+
+    The multiclass gradient collapses to:
+      grad = X^T(dp_dz * 2 * (P_R[y] - P_L[y])) + dS_L * (Gini_R - Gini_L)
+    where dS_L = X^T(dp_dz).
+    """
+    cdef Py_ssize_t i, k, j, lda = N
     cdef double S_L = 0.0, S_R = 0.0
     cdef double impurity_L = 0.0, impurity_R = 0.0, loss
     cdef double sw_i, tmp, one_minus_tmp
-    cdef double denom_L, denom_R, tmp_dp, gj, dS_R_w_i
+    cdef double scale_i
     cdef int yi
 
     matvec_N(X, w, z, N, d, lda)
@@ -236,7 +245,6 @@ cdef double fun_and_grad_multiclass_nogil(
         dp_dz[i] = gamma * tmp * one_minus_tmp * sw_i
 
     S_L += eps; S_R += eps
-    denom_L = S_L * S_L; denom_R = S_R * S_R
     for k in range(n_classes):
         P_k_L[k] = class_counts_L[k] / S_L
         P_k_R[k] = class_counts_R[k] / S_R
@@ -244,17 +252,17 @@ cdef double fun_and_grad_multiclass_nogil(
         impurity_R += P_k_R[k] * (1.0 - P_k_R[k])
     loss = S_L * impurity_L + S_R * impurity_R
 
-    matvec_T(X, dp_dz, grad_w, N, d, lda)
-    for i in range(d):
-        dS_R_w[i] = -grad_w[i]
+    # dS_L/dw = X^T(dp_dz)
+    matvec_T(X, dp_dz, tmp_dp_vec, N, d, lda)
+    # Build the per-sample class contribution into z and project once.
+    for i in range(N):
+        yi = <int>y[i]
+        scale_i = 2.0 * (P_k_R[yi] - P_k_L[yi])
+        z[i] = dp_dz[i] * scale_i
+    matvec_T(X, z, dS_R_w, N, d, lda)
+    for j in range(d):
+        grad_w[j] = dS_R_w[j] + tmp_dp_vec[j] * (impurity_R - impurity_L)
 
-    for k in range(n_classes):
-        for i in range(d):
-            gj = grad_w[i]; dS_R_w_i = dS_R_w[i]
-            tmp_dp = (class_counts_L[k] * gj / denom_L) * (1.0 - 2.0 * P_k_L[k])
-            tmp_dp += (class_counts_R[k] * dS_R_w_i / denom_R) * (1.0 - 2.0 * P_k_R[k])
-            grad_w[i] += (gj * impurity_L + S_L * tmp_dp
-                         + dS_R_w_i * impurity_R + S_R * (-tmp_dp))
     return loss
 
 
