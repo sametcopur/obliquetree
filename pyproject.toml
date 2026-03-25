@@ -37,5 +37,5 @@ Tracker = "https://github.com/sametcopur/obliquetree/issues"
 build = "cp310-* cp311-* cp312-* cp313-*"
 
 [build-system]
-requires = ["setuptools", "wheel", "Cython", "numpy>=2.2.1", "scipy>=1.15.0"]
+requires = ["setuptools", "wheel", "Cython>=3.1", "numpy>=2.2.1", "scipy>=1.15.0"]
 build-backend = "setuptools.build_meta"

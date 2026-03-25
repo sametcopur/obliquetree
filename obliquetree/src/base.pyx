@@ -124,6 +124,10 @@ cdef class TreeClassifier:
         try:
             self.n_features = n_columns
 
+            if self.root != NULL:
+                free_tree(self.root)
+                self.root = NULL
+
             # Bellek ayırma işlemleri
             sort_buffer = <SortItem*>malloc(n_samples * sizeof(SortItem))
             sample_indices = <int*>malloc(n_samples * sizeof(int))
