@@ -828,7 +828,8 @@ cdef void apply(
 ) noexcept nogil:
     cdef int i
     cdef const TreeNode* leaf
-    for i in range(n_samples):
+    cdef bint use_parallel = n_samples >= 1024
+    for i in prange(n_samples, nogil=True, schedule="static", use_threads_if=use_parallel):
         leaf = _find_leaf(node, X, i)
         out[i] = leaf.node_id
 
@@ -844,7 +845,8 @@ cdef void predict(
     cdef int j
     cdef const TreeNode* leaf
 
-    for i in range(n_samples):
+    cdef bint use_parallel = n_samples >= 1024
+    for i in prange(n_samples, nogil=True, schedule="static", use_threads_if=use_parallel):
         leaf = _find_leaf(node, X, i)
         if n_classes <= 2:
             out[i, 0] = leaf.value
