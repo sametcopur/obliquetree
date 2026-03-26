@@ -4,21 +4,58 @@ import os
 import numpy as np
 from setuptools.extension import Extension
 import sys
+import shutil
+import subprocess
 
 include_dirs_extra = []
 library_dirs = []
 extra_compile_args = []
 extra_link_args = []
 
+
+def find_libomp_prefix():
+    candidates = []
+
+    env_prefix = os.environ.get("LIBOMP_PREFIX")
+    if env_prefix:
+        candidates.append(env_prefix)
+
+    brew = shutil.which("brew")
+    if brew is not None:
+        try:
+            brew_prefix = subprocess.check_output(
+                [brew, "--prefix", "libomp"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if brew_prefix:
+                candidates.append(brew_prefix)
+        except (OSError, subprocess.CalledProcessError):
+            pass
+
+    candidates.extend(
+        [
+            "/opt/homebrew/opt/libomp",
+            "/usr/local/opt/libomp",
+        ]
+    )
+
+    seen = set()
+    for prefix in candidates:
+        if not prefix or prefix in seen:
+            continue
+        seen.add(prefix)
+        include_dir = os.path.join(prefix, "include")
+        lib_dir = os.path.join(prefix, "lib")
+        if os.path.isdir(include_dir) and os.path.isdir(lib_dir):
+            return prefix, include_dir, lib_dir
+
+    return None, None, None
+
 if sys.platform in ("win32", "linux", "darwin"):  # All platforms
     if sys.platform == "win32":
         extra_compile_args = [
-            "/O2",  # Equivalent to -O3
-            "/fp:fast",  # Fast floating point model
-            "/Ot",  # Favor fast code
-            "/Ox",  # Maximum optimization
-            "/Oi",  # Enable intrinsic functions
-            "/GT",  # Fiber-safe optimizations
+            "/O2",
             "/std:c++17",  # C++17 standard
             "/openmp",  # OpenMP support
         ]
@@ -26,9 +63,8 @@ if sys.platform in ("win32", "linux", "darwin"):  # All platforms
     else:  # linux and darwin (macOS)
         extra_compile_args = [
             "-O3",  # Maximum optimization
-            "-funroll-loops",  # Loop unrolling
+            "-funroll-loops",  # Unroll small loops (matvec d=2/3)
             "-ftree-vectorize",  # Enable vectorization
-            "-fstrict-aliasing",  # Enable strict aliasing
             "-fstack-protector-strong",  # Stack protection
             "-std=c++17",  # C++17 standard
         ]
@@ -38,10 +74,10 @@ if sys.platform in ("win32", "linux", "darwin"):  # All platforms
             extra_compile_args.append("-fopenmp")
             extra_link_args.append("-fopenmp")
         elif sys.platform == "darwin":
-            libomp_prefix = os.environ.get("LIBOMP_PREFIX", "/opt/homebrew/opt/libomp")
-            if os.path.isdir(libomp_prefix):
-                include_dirs_extra = [os.path.join(libomp_prefix, "include")]
-                library_dirs = [os.path.join(libomp_prefix, "lib")]
+            libomp_prefix, libomp_include, libomp_lib = find_libomp_prefix()
+            if libomp_prefix is not None:
+                include_dirs_extra = [libomp_include]
+                library_dirs = [libomp_lib]
                 extra_compile_args.extend(["-Xpreprocessor", "-fopenmp"])
                 extra_link_args.extend([
                     "-L" + library_dirs[0],
@@ -59,67 +95,19 @@ define_macros = [("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
 include_dirs = [np.get_include(), *include_dirs_extra]
 
 
+ext_names = ["tree", "oblique", "base", "utils", "metric", "ccp"]
 extensions = [
     Extension(
-        "obliquetree.src.tree",
-        ["obliquetree/src/tree.pyx"],
+        f"obliquetree.src.{name}",
+        [f"obliquetree/src/{name}.pyx"],
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         define_macros=define_macros,
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
         language="c++",
-    ),
-    Extension(
-        "obliquetree.src.oblique",
-        ["obliquetree/src/oblique.pyx"],
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        define_macros=define_macros,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        language="c++",
-    ),
-    Extension(
-        "obliquetree.src.base",
-        ["obliquetree/src/base.pyx"],
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        define_macros=define_macros,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        language="c++",
-    ),
-    Extension(
-        "obliquetree.src.utils",
-        ["obliquetree/src/utils.pyx"],
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        define_macros=define_macros,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        language="c++",
-    ),
-    Extension(
-        "obliquetree.src.metric",
-        ["obliquetree/src/metric.pyx"],
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        define_macros=define_macros,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        language="c++",
-    ),
-    Extension(
-        "obliquetree.src.ccp",
-        ["obliquetree/src/ccp.pyx"],
-        include_dirs=include_dirs,
-        library_dirs=library_dirs,
-        define_macros=define_macros,
-        extra_compile_args=extra_compile_args,
-        extra_link_args=extra_link_args,
-        language="c++",
-    ),
+    )
+    for name in ext_names
 ]
 
 setup(
