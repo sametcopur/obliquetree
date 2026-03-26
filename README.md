@@ -10,7 +10,7 @@
 
 ## Getting Started
 
-`obliquetree` combines advanced capabilities with efficient performance. It supports **oblique splits**, leveraging **L-BFGS optimization** to determine the best linear weights for splits, ensuring both speed and accuracy.
+`obliquetree` combines advanced capabilities with efficient performance. It supports **oblique splits**, leveraging a custom **L-BFGS optimization** routine to determine the best linear weights for splits, ensuring both speed and accuracy.
 
 In **traditional mode**, without oblique splits, `obliquetree` outperforms `scikit-learn` in terms of speed and adds support for **categorical variables**, providing a significant advantage over many traditional decision tree implementations.
 
@@ -36,6 +36,7 @@ model = Classifier(  # Replace "Classifier" with "Regressor" if performing regre
     use_oblique=True,       # Enable oblique splits
     max_depth=2,            # Set the maximum depth of the tree
     n_pair=2,               # Number of feature pairs for optimization
+    top_k=None,             # Optional: keep the default oblique feature screening heuristic
     random_state=42,        # Set a random state for reproducibility
     categories=[0, 10, 32], # Specify which features are categorical
 )

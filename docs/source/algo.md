@@ -34,12 +34,7 @@ t^* = \arg\min_t \text{Impurity}(\{z_i \leq t\})
 $$
 
 where Impurity is either Gini impurity for classification or MSE for regression.
-
-The gradient computation for threshold selection follows the same form as the binary classification case:
-
-$$
-\frac{\partial p_i}{\partial z_i} = \gamma p_i(1-p_i)
-$$
+In implementation, this threshold is chosen by an exact scan over the sorted projected values $\{z_i\}_{i=1}^N$ after the weight optimization step.
 
 ## 2. Binary Classification
 
@@ -47,7 +42,7 @@ $$
 
 | Left Node | Right Node |
 |-----------|------------|
-| $S_L = \sum_{i=1}^N \omega_i p_i + \epsilon\sum_{i=1}^N \omega_i$ | $S_R = \sum_{i=1}^N \omega_i(1-p_i) + \epsilon\sum_{i=1}^N \omega_i$ |
+| $S_L = \sum_{i=1}^N \omega_i p_i + \epsilon$ | $S_R = \sum_{i=1}^N \omega_i(1-p_i) + \epsilon$ |
 | $M_L = \sum_{i=1}^N \omega_i p_i y_i$ | $M_R = \sum_{i=1}^N \omega_i(1-p_i)y_i$ |
 | $P_{L1} = \frac{M_L}{S_L}$ | $P_{R1} = \frac{M_R}{S_R}$ |
 
@@ -106,15 +101,18 @@ $$
 
 | Left Node | Right Node |
 |-----------|------------|
-| $C_{L,k} = \sum_{i:y_i=k} \omega_i p_i + \frac{\epsilon}{K}\sum_{i=1}^N \omega_i$ | $C_{R,k} = \sum_{i:y_i=k} \omega_i(1-p_i) + \frac{\epsilon}{K}\sum_{i=1}^N \omega_i$ |
-| $P_{L,k} = \frac{C_{L,k}}{\sum_{j=0}^{K-1} C_{L,j}}$ | $P_{R,k} = \frac{C_{R,k}}{\sum_{j=0}^{K-1} C_{R,j}}$ |
+| $C_{L,k} = \sum_{i:y_i=k} \omega_i p_i$ | $C_{R,k} = \sum_{i:y_i=k} \omega_i(1-p_i)$ |
+| $S_L = \sum_{k=0}^{K-1} C_{L,k} + \epsilon$ | $S_R = \sum_{k=0}^{K-1} C_{R,k} + \epsilon$ |
+| $P_{L,k} = \frac{C_{L,k}}{S_L}$ | $P_{R,k} = \frac{C_{R,k}}{S_R}$ |
 
 These statistics track the weighted distribution of samples for each class in the child nodes.
 
 The optimization objective is to minimize:
 
 $$
-\mathcal{L}_{\text{MultiGini}}(\mathbf{w}) = \sum_{j=0}^{K-1} C_{L,j} \sum_{k=0}^{K-1} P_{L,k}(1-P_{L,k}) + \sum_{j=0}^{K-1} C_{R,j} \sum_{k=0}^{K-1} P_{R,k}(1-P_{R,k})
+\mathcal{L}_{\text{MultiGini}}(\mathbf{w}) =
+S_L \sum_{k=0}^{K-1} P_{L,k}(1-P_{L,k}) +
+S_R \sum_{k=0}^{K-1} P_{R,k}(1-P_{R,k})
 $$
 
 The optimization requires computing several gradients:
@@ -125,38 +123,30 @@ $$
 \frac{\partial p_i}{\partial z_i} = \gamma p_i(1-p_i)
 $$
 
-2. Class-wise counts gradients:
+2. Total soft mass gradient:
 
 $$
-\frac{\partial C_{L,k}}{\partial \mathbf{w}} = \sum_{i:y_i=k} \omega_i\frac{\partial p_i}{\partial z_i}\mathbf{x}_i
+\frac{\partial S_L}{\partial \mathbf{w}} = \sum_{i=1}^N \omega_i\frac{\partial p_i}{\partial z_i}\mathbf{x}_i
 $$
 
-$$
-\frac{\partial C_{R,k}}{\partial \mathbf{w}} = -\frac{\partial C_{L,k}}{\partial \mathbf{w}}
-$$
+3. Final gradient.
 
-3. Sum gradients:
+Define
 
 $$
-\frac{\partial S_L}{\partial \mathbf{w}} = \sum_{k=0}^{K-1}\frac{\partial C_{L,k}}{\partial \mathbf{w}}
+v_i = 2\,\omega_i\frac{\partial p_i}{\partial z_i}\left(P_{R,y_i} - P_{L,y_i}\right)
 $$
 
-$$
-\frac{\partial S_R}{\partial \mathbf{w}} = -\frac{\partial S_L}{\partial \mathbf{w}}
-$$
-
-4. Class probability gradients:
+Then
 
 $$
-\frac{\partial P_{L,k}}{\partial \mathbf{w}} = \frac{1}{S_L^2}\left(S_L\frac{\partial C_{L,k}}{\partial \mathbf{w}} - C_{L,k}\frac{\partial S_L}{\partial \mathbf{w}}\right)
-$$
-
-5. Final gradient:
-
-$$
-\frac{\partial \mathcal{L}_{\text{MultiGini}}}{\partial \mathbf{w}} = 
-\sum_{k=0}^{K-1} \left[\frac{\partial C_{L,k}}{\partial \mathbf{w}}\sum_{j=0}^{K-1} P_{L,j}(1-P_{L,j}) + C_{L,k}\sum_{j=0}^{K-1}\frac{\partial P_{L,j}}{\partial \mathbf{w}}(1-2P_{L,j})\right] + \\
-\sum_{k=0}^{K-1} \left[\frac{\partial C_{R,k}}{\partial \mathbf{w}}\sum_{j=0}^{K-1} P_{R,j}(1-P_{R,j}) + C_{R,k}\sum_{j=0}^{K-1}\frac{\partial P_{R,j}}{\partial \mathbf{w}}(1-2P_{R,j})\right]
+\frac{\partial \mathcal{L}_{\text{MultiGini}}}{\partial \mathbf{w}} =
+\mathbf{X}^\top \mathbf{v} +
+\frac{\partial S_L}{\partial \mathbf{w}}
+\left(
+\sum_{k=0}^{K-1} P_{R,k}(1-P_{R,k}) -
+\sum_{k=0}^{K-1} P_{L,k}(1-P_{L,k})
+\right)
 $$
 
 ### 3.2 One-vs-Rest Approach
@@ -176,7 +166,7 @@ $$
 
 | Left Node | Right Node |
 |-----------|------------|
-| $S_L = \sum_{i=1}^N \omega_i p_i$ | $S_R = \sum_{i=1}^N \omega_i(1-p_i)$ |
+| $S_L = \sum_{i=1}^N \omega_i p_i + \epsilon$ | $S_R = \sum_{i=1}^N \omega_i(1-p_i) + \epsilon$ |
 | $M_L = \sum_{i=1}^N \omega_i p_i y_i$ | $M_R = \sum_{i=1}^N \omega_i(1-p_i)y_i$ |
 | $m_L = \frac{M_L}{S_L}$ | $m_R = \frac{M_R}{S_R}$ |
 
@@ -219,9 +209,9 @@ $$
 $$
 \frac{\partial \mathcal{L}_{\text{LinReg}}}{\partial \mathbf{w}} = -\frac{1}{\sum_{i=1}^N \omega_i}\mathbf{X}^\top(\boldsymbol{\omega} \odot (\mathbf{y} - \mathbf{X}\mathbf{w}))
 $$
-## 5. L-BFGS-B Optimization
+## 5. L-BFGS Optimization
 
-The optimization process uses L-BFGS-B to solve:
+The optimization process uses a custom unconstrained L-BFGS implementation to solve:
 
 $$
 \min_{\mathbf{w}} \mathcal{L}(\mathbf{w})
@@ -234,6 +224,7 @@ Key elements of the optimization process:
 
 2. Stopping Criteria:
    - Stops when maximum iterations (`maxiter`) is reached
+   - Stops when the infinity norm of the gradient falls below a small tolerance
    - Stops when relative improvement falls below threshold:
 
      $$

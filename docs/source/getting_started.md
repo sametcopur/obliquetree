@@ -1,7 +1,7 @@
 # Getting Started
 
 
-`obliquetree` combines advanced capabilities with efficient performance. It supports **oblique splits**, leveraging **L-BFGS optimization** to determine the best linear weights for splits, ensuring both speed and accuracy.
+`obliquetree` combines advanced capabilities with efficient performance. It supports **oblique splits**, leveraging a custom **L-BFGS optimization** routine to determine the best linear weights for splits, ensuring both speed and accuracy.
 
 In **traditional mode**, without oblique splits, `obliquetree` outperforms `scikit-learn` in terms of speed and adds support for **categorical variables**, providing a significant advantage over many traditional decision tree implementations.
 
@@ -59,8 +59,14 @@ In very large trees (e.g., depth 20 or more), the performance of `obliquetree` m
 ### Oblique-Specific Parameters
 - **`n_pair` (int, default=2):**
   - The number of features to consider for oblique splits.
-  - All possible combinations of `n_pair` features from the continuous feature set are tested.
-  - **Example:** If there are 20 continuous features and `n_pair=2`, the algorithm will evaluate $\binom{20}{2}$ combinations.
+  - Candidate tuples are generated from a screened subset of usable numeric features.
+  - If `top_k=None`, the library uses an internal heuristic: $k=\min\{p,\max(\lfloor\sqrt{p}\rfloor, 2\,n\_pair)\}$ where $p$ is the number of usable numeric features.
+  - **Example:** If there are 20 usable numeric features and `n_pair=2`, the default heuristic keeps $k=\max(\lfloor\sqrt{20}\rfloor, 4)=4$ features and evaluates $\binom{4}{2}=6$ candidate pairs.
+
+- **`top_k` (int or None, default=None):**
+  - Number of screened numeric features kept before generating oblique candidate tuples.
+  - Set a larger value to search more aggressively.
+  - Set `top_k` equal to the number of usable numeric features to recover exhaustive candidate enumeration.
 
 - **`gamma` (float, default=1.0):**
   - Controls the separation strength in oblique splits.
@@ -87,16 +93,17 @@ In very large trees (e.g., depth 20 or more), the performance of `obliquetree` m
 
 ```{important}
 The `n_pair` parameter is critical for oblique splits. It defines how many features are combined to evaluate split candidates. For example:
-- If there are **20 continuous features** and `n_pair=3`, the algorithm evaluates $\binom{20}{3} = 1140$ combinations.
-- This combinatorial nature makes large values computationally expensive or infeasible.
+- If screening keeps **k** usable numeric features, the algorithm evaluates $\binom{k}{n\_pair}$ candidates.
+- With the default heuristic and **20 usable numeric features**, `n_pair=3` gives $k=\max(\lfloor\sqrt{20}\rfloor, 6)=6$, so the algorithm evaluates $\binom{6}{3}=20$ candidates.
+- If `top_k=20`, the same setting becomes exhaustive and evaluates $\binom{20}{3}=1140$ candidates.
 
 **Recommended Values:**
 - `n_pair=2` or `n_pair=3` for most use cases.
-- `n_pair` equal to the number of continuous features or slightly less for maximum flexibility.
+- Keep `top_k=None` unless you explicitly want a broader candidate search.
 
-Avoid setting `n_pair` to produce high number of combinations, as the computational cost grows rapidly and can make the algorithm impractical for large feature sets.
+Avoid large `top_k` together with large `n_pair`, as the computational cost still grows combinatorially in $\binom{k}{n\_pair}$.
 ```
 
 ```{important}
-While oblique splits based on linear projections aren't affected by the random state, the **soft decision tree method** in `obliquetree` can be highly sensitive to the **initial weights**. This sensitivity arises from the structure of the loss function and gradients being minimized during optimization. As a result **different random states** can lead to significantly different results.
+Oblique split search depends on deterministic random initialization and screening seeds. Use a fixed `random_state` when you need reproducible results across runs.
 ```

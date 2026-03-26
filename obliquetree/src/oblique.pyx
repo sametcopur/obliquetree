@@ -140,7 +140,7 @@ cdef double fun_and_grad_nogil(
     S_L = 0.0; p_y_sum = 0.0; p_1_y_sum = 0.0
     for i in range(N):
         sw_i = sample_weight[i]
-        tmp = sigmoid(z[i])
+        tmp = sigmoid(gamma * z[i])
         one_minus_tmp = 1.0 - tmp
         p[i] = tmp
         yi = y[i]
@@ -235,7 +235,7 @@ cdef double fun_and_grad_multiclass_nogil(
         class_counts_L[k] = 0.0; class_counts_R[k] = 0.0
     for i in range(N):
         sw_i = sample_weight[i]; yi = <int>y[i]
-        tmp = 1.0 / (1.0 + exp(-z[i]))
+        tmp = sigmoid(gamma * z[i])
         one_minus_tmp = 1.0 - tmp
         p[i] = tmp
         class_counts_L[yi] += tmp * sw_i
