@@ -282,6 +282,252 @@ cdef double _ols_pair_solve_nogil(
     return loss
 
 
+cdef inline double _logistic_nll_pair(
+    const double* X_pair,
+    const double* y,
+    const double* sample_weight,
+    const double total_weight,
+    const Py_ssize_t N, const Py_ssize_t d,
+    const double current_class,
+    const double* w,
+) noexcept nogil:
+    """Average weighted logistic NLL on a pair-projection ``X · w``.
+
+    Same scale as ``fun_and_grad_binary_linear_nogil``, used both for
+    Armijo line-search inside IRLS and for the final ranking score.
+    """
+    cdef Py_ssize_t i, a, lda = N
+    cdef double sw_i, y_i, z, p, loss = 0.0
+    for i in range(N):
+        sw_i = sample_weight[i]
+        y_i = 1.0 if y[i] == current_class else 0.0
+        z = 0.0
+        for a in range(d):
+            z = z + w[a] * X_pair[a * lda + i]
+        if z >= 0.0:
+            p = 1.0 / (1.0 + exp(-z))
+        else:
+            p = exp(z) / (1.0 + exp(z))
+        if y_i:
+            loss = loss - (sw_i / total_weight) * log(p + 1e-15)
+        else:
+            loss = loss - (sw_i / total_weight) * log(1.0 - p + 1e-15)
+    return loss
+
+
+cdef double _irls_pair_solve_nogil(
+    const double* X_pair,        # (N x d) column-major (lda=N)
+    const double* y,             # length N (raw class labels)
+    const double* sample_weight, # length N
+    const double total_weight,
+    const Py_ssize_t N, const Py_ssize_t d,
+    const double current_class,
+    const int max_iter,
+    const double tol,
+    const double ridge,
+    double* w_out,               # length d, used as warm-start in / final-out
+) noexcept nogil:
+    """No-intercept weighted ridge IRLS for binary logistic regression
+    (one-vs-rest), drop-in for the L-BFGS optimization on
+    ``fun_and_grad_binary_linear_nogil``.
+
+    Minimizes
+        L(w) = -Σ (sw_i / total_w) * [y_i log σ(X_i·w) + (1-y_i) log(1-σ(X_i·w))]
+    where ``y_i = 1 if y[i] == current_class else 0``.
+
+    Each iteration is a damped Newton (= IRLS) step:
+        p_i = σ(X_i·w_old), W_i = sw_i * p_i * (1 - p_i)
+        t_i = X_i·w_old + (y_i - p_i) / (p_i (1-p_i))
+        w_step = (X^T W X + ridge I)^{-1} X^T W t
+    Followed by a *monotone* backtracking line search on the actual NLL
+    (not full Armijo with a sufficient-decrease constant): the full step
+    is taken if ``nll_new <= nll_old``; otherwise α is halved up to
+    ``ARMIJO_MAX`` times until a non-increasing iterate is found. The
+    best (lowest-NLL) iterate ever seen is additionally tracked, so the
+    return value is never worse than the warm start; ``any_progress`` is
+    set whenever the line search accepts a step (even if equal-NLL),
+    which prevents spurious L-BFGS fallbacks on already-converged warm
+    starts. Empirically the line search also speeds the routine up:
+    without it Newton can oscillate on near-separable pairs, defeating
+    the early-exit on parameter-step magnitude and burning all
+    ``max_iter`` iterations.
+
+    Returns INFINITY if Cholesky fails on the first iteration, allocation
+    fails, the warm start has non-finite NLL, or every iteration's line
+    search exhausts itself before accepting a step (caller then falls
+    back to L-BFGS).
+
+    ``max_iter`` and ``tol`` are caller-supplied (currently the public
+    ``max_iter`` parameter and a dedicated internal IRLS tolerance —
+    `relative_change` from the public API is L-BFGS function-relative
+    while ``tol`` here is parameter-step max-norm; keeping them separate).
+    """
+    cdef Py_ssize_t i, a, b, k, lda = N
+    cdef int it, ar
+    cdef int ARMIJO_MAX = 5
+    cdef double sw_i, x_a, x_b, sum_val, pivot
+    cdef double y_i, z, p, dp, ww, t_resp, max_diff, diff, alpha
+    cdef double nll_old, nll_new, nll_best
+    cdef double eps = 1e-9
+    cdef bint cholesky_failed
+    cdef bint armijo_ok
+    cdef bint any_progress = False
+
+    cdef double* G = <double*>malloc(d * d * sizeof(double))
+    cdef double* rhs = <double*>malloc(d * sizeof(double))
+    cdef double* w_old = <double*>malloc(d * sizeof(double))
+    cdef double* w_new = <double*>malloc(d * sizeof(double))
+    cdef double* w_step = <double*>malloc(d * sizeof(double))
+    cdef double* w_best = <double*>malloc(d * sizeof(double))
+
+    if (G == NULL or rhs == NULL or w_old == NULL
+            or w_new == NULL or w_step == NULL or w_best == NULL):
+        if G != NULL: free(G)
+        if rhs != NULL: free(rhs)
+        if w_old != NULL: free(w_old)
+        if w_new != NULL: free(w_new)
+        if w_step != NULL: free(w_step)
+        if w_best != NULL: free(w_best)
+        return INFINITY
+
+    # Warm start from caller (screen-survivor weights or deterministic init,
+    # matching the L-BFGS path).
+    for a in range(d):
+        w_old[a] = w_out[a]
+        w_best[a] = w_out[a]
+
+    nll_old = _logistic_nll_pair(
+        X_pair, y, sample_weight, total_weight, N, d, current_class, w_old
+    )
+    if nll_old != nll_old or nll_old >= INFINITY:
+        free(G); free(rhs); free(w_old); free(w_new); free(w_step); free(w_best)
+        return INFINITY
+    nll_best = nll_old
+
+    for it in range(max_iter):
+        memset(G, 0, d * d * sizeof(double))
+        memset(rhs, 0, d * sizeof(double))
+
+        for i in range(N):
+            sw_i = sample_weight[i]
+            y_i = 1.0 if y[i] == current_class else 0.0
+
+            z = 0.0
+            for a in range(d):
+                z = z + w_old[a] * X_pair[a * lda + i]
+            if z >= 0.0:
+                p = 1.0 / (1.0 + exp(-z))
+            else:
+                p = exp(z) / (1.0 + exp(z))
+            if p < eps:
+                p = eps
+            elif p > 1.0 - eps:
+                p = 1.0 - eps
+            dp = p * (1.0 - p)
+
+            ww = sw_i * dp
+            t_resp = z + (y_i - p) / dp
+
+            for a in range(d):
+                x_a = X_pair[a * lda + i]
+                rhs[a] = rhs[a] + ww * x_a * t_resp
+                for b in range(a + 1):
+                    x_b = X_pair[b * lda + i]
+                    G[a * d + b] = G[a * d + b] + ww * x_a * x_b
+
+        for a in range(d):
+            for b in range(a + 1, d):
+                G[a * d + b] = G[b * d + a]
+
+        if ridge > 0.0:
+            for a in range(d):
+                G[a * d + a] = G[a * d + a] + ridge
+
+        cholesky_failed = False
+        for a in range(d):
+            for b in range(a + 1):
+                sum_val = G[a * d + b]
+                for k in range(b):
+                    sum_val = sum_val - G[a * d + k] * G[b * d + k]
+                if a == b:
+                    if not (sum_val > 0.0):
+                        cholesky_failed = True
+                        break
+                    pivot = sum_val ** 0.5
+                    G[a * d + a] = pivot
+                else:
+                    G[a * d + b] = sum_val / G[b * d + b]
+            if cholesky_failed:
+                break
+        if cholesky_failed:
+            break  # keep w_best from earlier iters (or warm start)
+
+        # Forward solve: L y' = rhs
+        for a in range(d):
+            sum_val = rhs[a]
+            for k in range(a):
+                sum_val = sum_val - G[a * d + k] * w_step[k]
+            w_step[a] = sum_val / G[a * d + a]
+        # Back solve: L^T w = y'
+        a = d - 1
+        while a >= 0:
+            sum_val = w_step[a]
+            for k in range(a + 1, d):
+                sum_val = sum_val - G[k * d + a] * w_step[k]
+            w_step[a] = sum_val / G[a * d + a]
+            a -= 1
+
+        # Armijo backtracking on the actual NLL.
+        alpha = 1.0
+        armijo_ok = False
+        nll_new = nll_old
+        for ar in range(ARMIJO_MAX + 1):
+            for a in range(d):
+                w_new[a] = w_old[a] + alpha * (w_step[a] - w_old[a])
+            nll_new = _logistic_nll_pair(
+                X_pair, y, sample_weight, total_weight, N, d, current_class, w_new
+            )
+            if nll_new == nll_new and nll_new <= nll_old:
+                armijo_ok = True
+                break
+            alpha = alpha * 0.5
+        if not armijo_ok:
+            break  # no improvement found; keep w_best
+
+        any_progress = True
+        if nll_new < nll_best:
+            nll_best = nll_new
+            for a in range(d):
+                w_best[a] = w_new[a]
+
+        max_diff = 0.0
+        for a in range(d):
+            diff = fabs(w_new[a] - w_old[a])
+            if diff > max_diff:
+                max_diff = diff
+            w_old[a] = w_new[a]
+        nll_old = nll_new
+
+        if max_diff < tol:
+            break
+
+    # If IRLS made no headway from the warm start, signal fallback to L-BFGS.
+    if not any_progress:
+        free(G); free(rhs); free(w_old); free(w_new); free(w_step); free(w_best)
+        return INFINITY
+
+    for a in range(d):
+        if w_best[a] != w_best[a] or w_best[a] >= INFINITY or w_best[a] <= -INFINITY:
+            free(G); free(rhs); free(w_old); free(w_new); free(w_step); free(w_best)
+            return INFINITY
+
+    for a in range(d):
+        w_out[a] = w_best[a]
+
+    free(G); free(rhs); free(w_old); free(w_new); free(w_step); free(w_best)
+    return nll_best
+
+
 cdef double fun_and_grad_linear_reg_nogil(
     const double* X, const double* y, const double* sample_weight,
     double* w,
@@ -1471,6 +1717,44 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
             if f_val < INFINITY:
                 pair_best_f = f_val
                 memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
+        # Classification-linear path (binary + OvR multiclass): damped
+        # IRLS via weighted Cholesky for the survivor full-optimization
+        # step only. (The cheap proxy_screen_nogil pass earlier still
+        # uses an L-BFGS-style single-step proxy, so the linear path is
+        # not entirely L-BFGS-free.) Iteration cap inherits the public
+        # ``max_iter`` parameter; the parameter-step tolerance is a
+        # dedicated internal IRLS constant — `relative_change` from the
+        # public API is L-BFGS function-relative and is not reused here.
+        # Per-class fallback: if IRLS fails for one OvR class, run
+        # L-BFGS for THAT class only so the OvR ranking does not silently
+        # skip a class candidate.
+        elif task == 0 and linear:
+            for ci in range(multi_range):
+                f_val = _irls_pair_solve_nogil(
+                    w.X_pair, y_ptr, sw_ptr, sum_sw,
+                    N, n_pair, <double>ci,
+                    maxiter, 1e-7, 1e-10, w.x_work,
+                )
+                if f_val == INFINITY:
+                    # IRLS preserved w.x_work (warm start) on failure;
+                    # run L-BFGS from the same start for this class.
+                    memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                    memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                    memset(w.rho, 0, lbfgs_m * sizeof(double))
+                    f_val = lbfgs_minimize_nogil(
+                        task, n_classes, <double>ci, linear,
+                        w.x_work, w.X_pair, y_ptr, sw_ptr, sum_sw,
+                        N, n_pair, gamma, 1e-6, lbfgs_m,
+                        maxiter, relative_change, 1e-5, 20,
+                        w.grad, w.grad_new, w.direction, w.x_new,
+                        w.s_hist, w.y_hist, w.rho, w.alpha_buf,
+                        w.buf_z, w.buf_p, w.buf_dp_dz,
+                        w.buf1, w.buf2, w.buf3,
+                        w.buf4, w.buf5, w.buf6, w.buf7)
+                if f_val < pair_best_f:
+                    pair_best_f = f_val
+                    memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
 
         if pair_best_f == INFINITY:
             for ci in range(multi_range):
