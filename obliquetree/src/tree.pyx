@@ -420,6 +420,7 @@ cdef TreeNode* build_tree_recursive(
     node.leaf_intercept_buf = NULL
     node.leaf_n_coef = 0
     node.leaf_n_models = 0
+    node.impurity = 0.0
 
     if n_classes > 2:
         calculate_node_value_multiclass(
@@ -976,7 +977,7 @@ cdef bint _centered_weighted_ols(
     const int d,
     const double* w_per_sample,
     const double* z_per_sample,
-    const double leaf_ridge,
+    const double leaf_l2,
     double* x_mean,
     double* G,
     double* rhs,
@@ -1024,9 +1025,9 @@ cdef bint _centered_weighted_ols(
         for k in range(j + 1, d):
             G[j * d + k] = G[k * d + j]
 
-    if leaf_ridge > 0.0:
+    if leaf_l2 > 0.0:
         for j in range(d):
-            G[j * d + j] = G[j * d + j] + leaf_ridge
+            G[j * d + j] = G[j * d + j] + leaf_l2
 
     if not _solve_cholesky(G, rhs, coef_out, d):
         return False
@@ -1047,7 +1048,7 @@ cdef bint _fit_multinomial(
     const double[::1] y,
     const double[::1] sample_weight,
     const int K,
-    const double leaf_ridge,
+    const double leaf_l2,
     double* coef_out,
     double* intercept_out,
 ) noexcept nogil:
@@ -1093,7 +1094,7 @@ cdef bint _fit_multinomial(
     cdef bint converged = False
     cdef double bv
 
-    eff_ridge = leaf_ridge
+    eff_ridge = leaf_l2
     if eff_ridge < 1e-10:
         eff_ridge = 1e-10
 
@@ -1224,7 +1225,7 @@ cdef bint _fit_logistic_one(
     const double[::1] y_target,
     const double[::1] sample_weight,
     const int target_class,
-    const double leaf_ridge,
+    const double leaf_l2,
     double* coef_out,
     double* intercept_out,
     double* x_mean,
@@ -1275,7 +1276,7 @@ cdef bint _fit_logistic_one(
     # Gram is non-singular even when numeric features are correlated /
     # rank-deficient. User-supplied ridge is used unchanged when above
     # the floor.
-    inner_ridge = leaf_ridge
+    inner_ridge = leaf_l2
     if inner_ridge < 1e-10:
         inner_ridge = 1e-10
 
@@ -1341,7 +1342,7 @@ cdef void _fit_one_leaf(
     const int d,
     const int n_classes,
     const bint task,
-    const double leaf_ridge,
+    const double leaf_l2,
     const int* sample_indices,
     const int n_leaf_samples,
     double* x_mean,
@@ -1372,6 +1373,12 @@ cdef void _fit_one_leaf(
         return
     if n_leaf_samples < d + 1:
         return
+    # Pure / constant leaf: y is identical (gini=0 for classification,
+    # MSE=0 for regression) -> linear fit collapses to a constant anyway,
+    # so skip the Newton/IRLS work and let predict use leaf.value /
+    # leaf.value_multiclass.
+    if leaf.impurity == 0.0:
+        return
 
     if task == 1:
         n_models = 1
@@ -1400,7 +1407,7 @@ cdef void _fit_one_leaf(
 
         if not _centered_weighted_ols(
             X, sample_indices, n_leaf_samples, numeric_features, d,
-            w_buf, z_buf, leaf_ridge,
+            w_buf, z_buf, leaf_l2,
             x_mean, G, rhs, coef_buf, &intercept_val,
         ):
             free(leaf.leaf_coef)
@@ -1417,7 +1424,7 @@ cdef void _fit_one_leaf(
         # Binary classification: logistic IRLS
         if not _fit_logistic_one(
             X, sample_indices, n_leaf_samples, numeric_features, d,
-            y, sample_weight, -1, leaf_ridge,
+            y, sample_weight, -1, leaf_l2,
             coef_buf, &intercept_val,
             x_mean, G, rhs, w_buf, z_buf, coef_new_buf,
         ):
@@ -1435,7 +1442,7 @@ cdef void _fit_one_leaf(
         # Multiclass: proper softmax regression via Newton-Raphson
         if not _fit_multinomial(
             X, sample_indices, n_leaf_samples, numeric_features, d,
-            y, sample_weight, n_classes, leaf_ridge,
+            y, sample_weight, n_classes, leaf_l2,
             leaf.leaf_coef, leaf.leaf_intercept_buf,
         ):
             free(leaf.leaf_coef)
@@ -1457,7 +1464,7 @@ cdef void _walk_and_fit(
     const int d,
     const int n_classes,
     const bint task,
-    const double leaf_ridge,
+    const double leaf_l2,
     int* sample_indices,
     const int n_node_samples,
     double* x_mean,
@@ -1480,7 +1487,7 @@ cdef void _walk_and_fit(
             d,
             n_classes,
             task,
-            leaf_ridge,
+            leaf_l2,
             sample_indices,
             n_node_samples,
             x_mean,
@@ -1509,13 +1516,13 @@ cdef void _walk_and_fit(
 
     _walk_and_fit(
         node.left, X, y, sample_weight,
-        numeric_features, d, n_classes, task, leaf_ridge,
+        numeric_features, d, n_classes, task, leaf_l2,
         sample_indices, left_count,
         x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
     )
     _walk_and_fit(
         node.right, X, y, sample_weight,
-        numeric_features, d, n_classes, task, leaf_ridge,
+        numeric_features, d, n_classes, task, leaf_l2,
         sample_indices + left_count, n_node_samples - left_count,
         x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
     )
@@ -1528,7 +1535,7 @@ cdef void fit_linear_leaves(
     const double[::1] sample_weight,
     const int* numeric_features,
     const int n_numeric_features,
-    const double leaf_ridge,
+    const double leaf_l2,
     const int n_samples,
     const int n_classes,
     const bint task,
@@ -1574,7 +1581,7 @@ cdef void fit_linear_leaves(
 
     _walk_and_fit(
         root, X, y, sample_weight,
-        numeric_features, d, n_classes, task, leaf_ridge,
+        numeric_features, d, n_classes, task, leaf_l2,
         sample_indices, n_samples,
         x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
     )

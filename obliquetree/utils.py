@@ -229,7 +229,9 @@ def visualize_tree(
         if is_leaf:
             # For leaf nodes
             label_parts.append("leaf")
-            label_parts.append(_format_value_str(node, params))
+            label_parts.append(
+                _format_value_str(node, params, feature_names, max_oblique)
+            )
 
             # Add impurity for leaf nodes if requested and available
             if show_gini and "impurity" in node:
@@ -283,7 +285,9 @@ def visualize_tree(
             label_parts.append(split_info)
 
             if show_node_value:
-                label_parts.append(_format_value_str(node, params))
+                label_parts.append(
+                    _format_value_str(node, params, feature_names, max_oblique)
+                )
 
             # Add Gini impurity if requested
             if show_gini and "impurity" in node:
@@ -442,6 +446,123 @@ def export_tree_to_onnx(tree: Union[Classifier, Regressor]) -> None:
         )
         return node
 
+    def _emit_linear_leaf(node_dict, nodes_list, target_name):
+        """Emit ONNX ops to evaluate a linear / logistic / softmax leaf."""
+        leaf_coef = node_dict["leaf_coef"]
+        leaf_intercept = node_dict["leaf_intercept"]
+        n_models = int(node_dict.get("leaf_n_models", 1))
+        n_coef = int(node_dict.get("leaf_n_coef", 0))
+        numeric_features_local = params.get("numeric_features") or []
+        task_local = params["task"]
+        n_classes_local = params["n_classes"]
+
+        # Build per-model logit (each is a [1] tensor in ONNX).
+        logit_outputs = []
+        for k in range(n_models):
+            partials = []
+            for j in range(n_coef):
+                feat_idx = (
+                    numeric_features_local[j]
+                    if j < len(numeric_features_local)
+                    else j
+                )
+                idx_node = _make_constant_int_node(
+                    _unique_name("nf_idx"), [feat_idx], [1]
+                )
+                nodes_list.append(idx_node)
+
+                gout = _unique_name("nf_gather")
+                nodes_list.append(
+                    helper.make_node(
+                        "Gather",
+                        inputs=["X", idx_node.output[0]],
+                        outputs=[gout],
+                        axis=0,
+                    )
+                )
+
+                wnode = _make_constant_float_node(
+                    _unique_name("leaf_w"), leaf_coef[k * n_coef + j], []
+                )
+                nodes_list.append(wnode)
+
+                mout = _unique_name("leaf_mul")
+                nodes_list.append(
+                    helper.make_node(
+                        "Mul", inputs=[gout, wnode.output[0]], outputs=[mout]
+                    )
+                )
+                partials.append(mout)
+
+            inter_node = _make_constant_float_node(
+                _unique_name("leaf_b"), leaf_intercept[k], []
+            )
+            nodes_list.append(inter_node)
+
+            if not partials:
+                logit_k = inter_node.output[0]
+            else:
+                tmp = partials[0]
+                for p in partials[1:]:
+                    aout = _unique_name("leaf_add")
+                    nodes_list.append(
+                        helper.make_node("Add", inputs=[tmp, p], outputs=[aout])
+                    )
+                    tmp = aout
+                logit_out = _unique_name("leaf_logit")
+                nodes_list.append(
+                    helper.make_node(
+                        "Add",
+                        inputs=[tmp, inter_node.output[0]],
+                        outputs=[logit_out],
+                    )
+                )
+                logit_k = logit_out
+            logit_outputs.append(logit_k)
+
+        if n_models == 1:
+            if task_local:
+                # regression: squeeze [1] -> scalar
+                nodes_list.append(
+                    helper.make_node(
+                        "Squeeze", inputs=[logit_outputs[0]], outputs=[target_name]
+                    )
+                )
+            elif n_classes_local == 2:
+                # binary classification: sigmoid then squeeze
+                sig_out = _unique_name("leaf_sig")
+                nodes_list.append(
+                    helper.make_node(
+                        "Sigmoid", inputs=[logit_outputs[0]], outputs=[sig_out]
+                    )
+                )
+                nodes_list.append(
+                    helper.make_node(
+                        "Squeeze", inputs=[sig_out], outputs=[target_name]
+                    )
+                )
+            else:
+                nodes_list.append(
+                    helper.make_node(
+                        "Identity",
+                        inputs=[logit_outputs[0]],
+                        outputs=[target_name],
+                    )
+                )
+        else:
+            # Multiclass: concat K logits (each [1]) -> [K], then softmax along axis=0.
+            cat_out = _unique_name("leaf_logits")
+            nodes_list.append(
+                helper.make_node(
+                    "Concat", inputs=logit_outputs, outputs=[cat_out], axis=0
+                )
+            )
+            nodes_list.append(
+                helper.make_node(
+                    "Softmax", inputs=[cat_out], outputs=[target_name], axis=0
+                )
+            )
+
     def _build_subgraph_for_node(node_dict, n_classes):
         """
         Recursively builds a subgraph (for 'If' branches) from the given node definition.
@@ -459,7 +580,14 @@ def export_tree_to_onnx(tree: Union[Classifier, Regressor]) -> None:
 
         # If this is a leaf node
         if node_dict["is_leaf"]:
-            if "values" in node_dict and isinstance(node_dict["values"], list):
+            has_linear = (
+                node_dict.get("leaf_n_models", 0) > 0
+                and "leaf_coef" in node_dict
+                and "leaf_intercept" in node_dict
+            )
+            if has_linear:
+                _emit_linear_leaf(node_dict, nodes, out_name)
+            elif "values" in node_dict and isinstance(node_dict["values"], list):
                 # Multi-class leaf
                 val_array = node_dict["values"]
                 shape = [len(val_array)]
@@ -694,9 +822,19 @@ def _format_float(value: float) -> str:
     return f"{value:.2f}"
 
 
-def _format_value_str(node: Dict[str, Any], params: Dict[str, Any]) -> str:
+def _format_value_str(
+    node: Dict[str, Any],
+    params: Dict[str, Any],
+    feature_names: Optional[List[str]] = None,
+    max_terms: Optional[int] = None,
+) -> str:
     """
-    Format value string based on task type (regression vs classification) and number of classes
+    Format value string based on task type (regression vs classification) and number of classes.
+
+    For linear leaves (``linear_leaf=True``) on a leaf node, the formula
+    ``intercept + sum(coef * feat)`` is rendered (with ``sigmoid`` for binary
+    and ``softmax`` for multiclass). Falls back to the constant leaf format
+    otherwise.
 
     Parameters:
     -----------
@@ -704,7 +842,20 @@ def _format_value_str(node: Dict[str, Any], params: Dict[str, Any]) -> str:
         The tree node dictionary containing values or value
     params : Dict[str, Any]
         Tree parameters containing task and n_classes information
+    feature_names : Optional[List[str]]
+        Optional human-readable feature names used inside the linear-leaf formula.
+    max_terms : Optional[int]
+        Optional limit on the number of feature terms to render per linear leaf.
     """
+    is_leaf = "left" not in node and "right" not in node
+    if (
+        is_leaf
+        and node.get("leaf_n_models", 0) > 0
+        and "leaf_coef" in node
+        and "leaf_intercept" in node
+    ):
+        return _format_linear_leaf_str(node, params, feature_names, max_terms)
+
     # Check if it's a regression task
     if params["task"]:
         value = (
@@ -726,6 +877,63 @@ def _format_value_str(node: Dict[str, Any], params: Dict[str, Any]) -> str:
                 for v in node.get("values", [0.0] * params["n_classes"])
             )
             return f"values: [{values_str}]"
+
+
+def _format_linear_leaf_str(
+    node: Dict[str, Any],
+    params: Dict[str, Any],
+    feature_names: Optional[List[str]],
+    max_terms: Optional[int],
+) -> str:
+    """Render a linear-leaf formula for visualization."""
+    coef = node["leaf_coef"]
+    intercept = node["leaf_intercept"]
+    n_models = int(node.get("leaf_n_models", 1))
+    n_coef = int(node.get("leaf_n_coef", 0))
+    numeric_features = params.get("numeric_features") or list(range(n_coef))
+    task = params["task"]
+    n_classes = params["n_classes"]
+
+    def feat_label(j: int) -> str:
+        idx = numeric_features[j] if j < len(numeric_features) else j
+        if feature_names and idx < len(feature_names):
+            return feature_names[idx]
+        return f"f{idx}"
+
+    def fmt_linear(model_idx: int) -> str:
+        b = intercept[model_idx]
+        coefs = [coef[model_idx * n_coef + j] for j in range(n_coef)]
+
+        order = sorted(range(n_coef), key=lambda j: abs(coefs[j]), reverse=True)
+        truncated = False
+        if max_terms is not None and len(order) > max_terms:
+            order = order[:max_terms]
+            truncated = True
+
+        pieces = [_format_float(b)]
+        for j in order:
+            w = coefs[j]
+            if w == 0.0:
+                continue
+            sign = "-" if w < 0 else "+"
+            pieces.append(f"{sign} {_format_float(abs(w))}·{feat_label(j)}")
+        if truncated:
+            pieces.append("+ ...")
+        return " ".join(pieces)
+
+    if n_models == 1:
+        formula = fmt_linear(0)
+        if task:  # regression
+            return f"y = {formula}"
+        if n_classes == 2:  # binary
+            return f"P(y=1) = σ({formula})"
+        return f"linear: {formula}"  # shouldn't normally reach (single-model multiclass)
+
+    # multiclass softmax
+    lines = [f"linear leaf · softmax over {n_models} classes:"]
+    for k in range(n_models):
+        lines.append(f"  z[{k}] = {fmt_linear(k)}")
+    return "\n".join(lines)
 
 
 def _create_oblique_expression(

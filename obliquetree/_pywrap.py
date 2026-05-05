@@ -3,7 +3,6 @@ from .src.base import TreeClassifier
 from typing import List, Optional
 from numpy.typing import ArrayLike, NDArray
 import numpy as np
-from math import comb
 import warnings
 
 
@@ -84,6 +83,72 @@ class BaseTree(TreeClassifier):
         Early stopping threshold for L-BFGS optimization.
 
         - Only used when `use_oblique=True`.
+
+    linear_leaf : bool
+        If `True`, fit a small parametric model inside every terminal leaf
+        instead of returning a single constant. See ``Notes`` for the per-task
+        formulation.
+
+    leaf_l2 : float
+        L2 (ridge) penalty added to the leaf-level normal equations / Hessian
+        diagonal when ``linear_leaf=True``. See ``Notes`` for the regression
+        vs. classification semantics.
+
+    Notes
+    -----
+    **Linear leaves (``linear_leaf=True``)**
+
+    A standard decision tree returns a single constant at each terminal leaf
+    (the weighted mean for regression, the class frequency for
+    classification). With ``linear_leaf=True`` each leaf instead fits a small
+    parametric model on the training samples that fall into it. The tree
+    splits still partition the input space; the leaf model only refines the
+    prediction inside that local region. This combines the local
+    piecewise-constant behaviour of trees with the smooth interpolation of a
+    linear model and is useful when the target is approximately
+    piecewise-linear within tree-segmented regions.
+
+    Only **numeric** features participate in the leaf model. Columns listed
+    in ``categories`` are excluded from the leaf coefficients because the
+    tree splits already capture categorical structure; mixing them into the
+    leaf regression would double-count their effect.
+
+    The leaf model is selected based on the task:
+
+    - **Regression**: weighted ordinary least squares (OLS) on the leaf
+      samples, solved in closed form via a centered Cholesky decomposition.
+      Prediction: ``intercept + Σ coef · x_numeric``.
+    - **Binary classification**: weighted logistic regression fit by
+      iteratively reweighted least squares (IRLS) for a fixed 25 iterations
+      (each iteration is the same Cholesky solve as the regression case).
+      Prediction: ``sigmoid(intercept + Σ coef · x_numeric)`` interpreted as
+      ``P(class = 1)``.
+    - **Multiclass classification (n_classes > 2)**: multinomial softmax
+      regression with K-1 reference-class parametrization (the last class
+      logit is fixed at 0 to remove the rank-1 redundancy of the symmetric
+      K-class form). Fit by Newton-Raphson on the full (K-1)·(d+1) Hessian
+      for a fixed 50 iterations. Prediction: ``softmax`` over the K logits.
+
+    The Newton/IRLS schemes use a fixed iteration count and accept the last
+    finite iterate; convergence to a tolerance is not strictly required. A
+    leaf falls back to the constant prediction (mean / frequency) when:
+
+    - the leaf has fewer samples than coefficients (``n_samples < d + 1``),
+    - the Hessian/Gram matrix is singular (e.g. correlated numeric features
+      with ``leaf_l2 = 0`` in the regression case),
+    - the Newton/IRLS step produces non-finite parameters,
+    - any used numeric feature is NaN/Inf at predict time.
+
+    **``leaf_l2``** adds an L2 penalty ``λ · I`` to the coefficient block of
+    the normal equations (intercept excluded). For regression
+    ``leaf_l2 = 0`` is honored exactly (true unregularized OLS); on
+    rank-deficient numeric features the leaf falls back to the mean. For
+    classification a tiny internal floor of ``1e-10`` is always applied
+    because the K-class softmax Hessian is rank-deficient by construction
+    without it; ``leaf_l2 = 0`` therefore behaves as ``1e-10`` for
+    classifiers. Tree leaves are typically small, so a larger value
+    (e.g. ``0.1`` - ``1.0``) often improves probability calibration without
+    harming accuracy.
     """
 
     def __init__(
@@ -103,7 +168,7 @@ class BaseTree(TreeClassifier):
         max_iter: int,
         relative_change: float,
         linear_leaf: bool = False,
-        leaf_ridge: float = 1e-6,
+        leaf_l2: float = 1e-6,
     ) -> None:
         # Validate and assign parameters
         self.task = task
@@ -124,8 +189,8 @@ class BaseTree(TreeClassifier):
         )
         self.random_state = self._validate_random_state(random_state)
         self.categories = self._validate_categories(categories)
-        self.linear_leaf = self._validate_linear_leaf(linear_leaf, task)
-        self.leaf_ridge = self._validate_leaf_ridge(leaf_ridge)
+        self.linear_leaf = self._validate_linear_leaf(linear_leaf)
+        self.leaf_l2 = self._validate_leaf_l2(leaf_l2)
         self._fit = False
         self._categories: dict[int, NDArray]
 
@@ -147,7 +212,7 @@ class BaseTree(TreeClassifier):
             self.task,
             1,
             self.linear_leaf,
-            self.leaf_ridge,
+            self.leaf_l2,
         )
 
     def __getstate__(self):
@@ -190,7 +255,7 @@ class BaseTree(TreeClassifier):
             f"max_iter={getattr(self, 'max_iter', None)}, "
             f"relative_change={getattr(self, 'relative_change', None)}, "
             f"linear_leaf={getattr(self, 'linear_leaf', None)}, "
-            f"leaf_ridge={getattr(self, 'leaf_ridge', None)}"
+            f"leaf_l2={getattr(self, 'leaf_l2', None)}"
         )
         return f"{self.__class__.__name__}({param_str})"
 
@@ -299,19 +364,19 @@ class BaseTree(TreeClassifier):
             raise ValueError("use_oblique must be a boolean")
         return use_oblique
 
-    def _validate_linear_leaf(self, linear_leaf: bool, task: bool) -> bool:
+    def _validate_linear_leaf(self, linear_leaf: bool) -> bool:
         if not isinstance(linear_leaf, bool):
             raise ValueError("linear_leaf must be a boolean")
         return linear_leaf
 
-    def _validate_leaf_ridge(self, leaf_ridge: float) -> float:
-        if not isinstance(leaf_ridge, (int, float)) or isinstance(leaf_ridge, bool):
-            raise ValueError("leaf_ridge must be a number")
-        if not np.isfinite(leaf_ridge):
-            raise ValueError("leaf_ridge must be finite (no NaN/Inf)")
-        if leaf_ridge < 0.0:
-            raise ValueError("leaf_ridge must be >= 0.0")
-        return float(leaf_ridge)
+    def _validate_leaf_l2(self, leaf_l2: float) -> float:
+        if not isinstance(leaf_l2, (int, float)) or isinstance(leaf_l2, bool):
+            raise ValueError("leaf_l2 must be a number")
+        if not np.isfinite(leaf_l2):
+            raise ValueError("leaf_l2 must be finite (no NaN/Inf)")
+        if leaf_l2 < 0.0:
+            raise ValueError("leaf_l2 must be >= 0.0")
+        return float(leaf_l2)
 
     def _coerce_feature_matrix(self, X: ArrayLike) -> NDArray:
         X = np.asarray(X, order="F", dtype=np.float64)
@@ -380,10 +445,6 @@ class BaseTree(TreeClassifier):
 
         # Validate categorical features
         self._validate_categories_in_data(X, is_fit=True)
-
-        # Warn if the number of feature combinations is too large for oblique splits
-        if self.use_oblique:
-            self._warn_large_combinations(X.shape[1] - len(self.categories))
 
         super().fit(X, y, sample_weight)
 
@@ -546,14 +607,6 @@ class BaseTree(TreeClassifier):
                             f"Available categories: {self._categories[idx]}"
                         )
 
-    def _warn_large_combinations(self, n_features: int) -> None:
-        total_combinations = comb(n_features, self.n_pair)
-        if total_combinations > 1000:  # Optimal threshold can be adjusted
-            warnings.warn(
-                "The number of feature combinations for oblique splits is very large, which may lead to long training times. "
-                "Consider reducing `n_pair` or the number of features."
-            )
-
     def apply(self, X: ArrayLike) -> NDArray:
         """
         Return the index of the leaf that each sample is predicted as.
@@ -622,7 +675,7 @@ class Classifier(BaseTree):
         max_iter: int = 100,
         relative_change: float = 0.001,
         linear_leaf: bool = False,
-        leaf_ridge: float = 1e-6,
+        leaf_l2: float = 1e-6,
     ):
         """
         A decision tree classifier supporting both traditional axis-aligned and oblique splits.
@@ -690,36 +743,30 @@ class Classifier(BaseTree):
             - Only used when `use_oblique=True`.
 
         linear_leaf : bool, default=False
-            If `True`, fit a regularized parametric leaf using only numeric
-            features (categorical features in `categories` are excluded):
+            If `True`, replace the constant leaf with a small parametric
+            model fit on the leaf samples:
 
-            - Binary classification: weighted logistic regression fit by
-              IRLS for a fixed number of iterations (25). The last finite
-              iterate is used; convergence to a tolerance is not strictly
-              required. Predict returns
-              ``sigmoid(intercept + coef · x)`` as ``P(class=1)``.
-            - Multi-class classification (``n_classes > 2``): multinomial
-              softmax regression with K-1 reference-class parametrization,
-              fit by Newton-Raphson on the full Hessian for a fixed number
-              of iterations (50). The last finite iterate is used. Predict
+            - Binary classification → weighted logistic regression (IRLS,
+              25 iters); predict returns ``sigmoid(intercept + coef · x)``
+              as ``P(class=1)``.
+            - Multiclass (``n_classes > 2``) → multinomial softmax
+              regression with K-1 reference-class parametrization
+              (Newton-Raphson on the full Hessian, 50 iters); predict
               returns the softmax over per-class logits.
 
-            Falls back to the leaf class frequency when the leaf has fewer
-            samples than coefficients, when the Hessian/Gram matrix is
-            singular, when the Newton/IRLS step produces non-finite
-            parameters, or when any used feature is NaN/Inf at predict
-            time.
+            Only numeric features participate in the leaf coefficients
+            (categorical features in ``categories`` are excluded; the
+            tree splits already capture their structure). See ``Notes``
+            on ``BaseTree`` for the full mechanism, fallback rules, and
+            iteration policy.
 
-        leaf_ridge : float, default=1e-6
-            Ridge regularization added to the leaf-level Hessian/Gram
-            diagonal when `linear_leaf=True`. For classification a tiny
-            internal floor of ``1e-10`` is always applied on top of the
-            user value because the multinomial softmax Hessian is
-            rank-deficient by construction without it; ``leaf_ridge=0.0``
-            therefore behaves as ``1e-10`` for classifiers. Tree leaves
-            are typically small, so a larger value (e.g. ``0.1`` -
-            ``1.0``) often improves probability calibration without
-            harming accuracy.
+        leaf_l2 : float, default=1e-6
+            L2 (ridge) penalty on the leaf coefficients. For
+            classification a tiny internal floor of ``1e-10`` is always
+            applied (the K-class softmax Hessian is rank-deficient
+            without it), so ``leaf_l2=0.0`` is effectively ``1e-10`` for
+            classifiers. A larger value (e.g. ``0.1`` - ``1.0``) often
+            improves probability calibration without harming accuracy.
         """
         super().__init__(
             task=False,
@@ -737,7 +784,7 @@ class Classifier(BaseTree):
             max_iter=max_iter,
             relative_change=relative_change,
             linear_leaf=linear_leaf,
-            leaf_ridge=leaf_ridge,
+            leaf_l2=leaf_l2,
         )
 
     def fit(
@@ -830,7 +877,7 @@ class Regressor(BaseTree):
         max_iter: int = 100,
         relative_change: float = 0.001,
         linear_leaf: bool = False,
-        leaf_ridge: float = 1e-6,
+        leaf_l2: float = 1e-6,
     ):
         """
         A decision tree regressor supporting both traditional axis-aligned and oblique splits.
@@ -898,22 +945,22 @@ class Regressor(BaseTree):
             - Only used when `use_oblique=True`.
 
         linear_leaf : bool, default=False
-            If `True`, fit a weighted ordinary-least-squares model at each
-            terminal leaf using only numeric features (categorical features
-            listed in `categories` are excluded). At inference each leaf
-            returns ``intercept + sum(coef * x_numeric)``. Falls back to the
-            leaf mean when the leaf has fewer samples than coefficients,
-            when the Gram matrix is singular (Cholesky failure on
-            rank-deficient X with ``leaf_ridge=0``), or when any used
-            feature is NaN/Inf at predict time.
+            If `True`, replace the constant leaf (the weighted mean of
+            ``y``) with a weighted ordinary-least-squares model fit on
+            the leaf samples. Predict returns
+            ``intercept + sum(coef * x_numeric)``.
 
-        leaf_ridge : float, default=1e-6
-            Ridge added to the leaf normal-equations diagonal when
-            `linear_leaf=True`. ``0.0`` is honored exactly (true
-            unregularized OLS); on rank-deficient numeric features the
-            leaf will fall back to the mean instead. Pass a small
-            positive value (e.g. ``1e-8``) to enable a regularized fit on
-            correlated features.
+            Only numeric features participate in the leaf coefficients
+            (categorical features in ``categories`` are excluded; the
+            tree splits already capture their structure). See ``Notes``
+            on ``BaseTree`` for the full mechanism and fallback rules.
+
+        leaf_l2 : float, default=1e-6
+            L2 (ridge) penalty on the leaf coefficients. ``0.0`` is
+            honored exactly (true unregularized OLS); on rank-deficient
+            numeric features the affected leaf falls back to the mean
+            instead. Pass a small positive value (e.g. ``1e-8``) to
+            keep the fit on correlated features.
         """
         super().__init__(
             task=True,
@@ -931,7 +978,7 @@ class Regressor(BaseTree):
             max_iter=max_iter,
             relative_change=relative_change,
             linear_leaf=linear_leaf,
-            leaf_ridge=leaf_ridge,
+            leaf_l2=leaf_l2,
         )
 
     def fit(

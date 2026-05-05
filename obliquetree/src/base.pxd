@@ -22,7 +22,7 @@ cdef class TreeClassifier:
     cdef bint cat_
     cdef public int n_features
     cdef public bint linear_leaf
-    cdef public double leaf_ridge
+    cdef public double leaf_l2
     cdef int* numeric_features_
     cdef int n_numeric_features_
 
