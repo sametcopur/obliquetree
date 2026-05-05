@@ -66,7 +66,8 @@ cdef class TreeClassifier:
                         bint task,
                         int n_classes,
                         bint linear_leaf,
-                        double leaf_l2) -> None:
+                        double leaf_l2,
+                        int leaf_max_iter) -> None:
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
         self.min_impurity_decrease = min_impurity_decrease
@@ -84,6 +85,7 @@ cdef class TreeClassifier:
         self.n_classes = n_classes
         self.linear_leaf = linear_leaf
         self.leaf_l2 = leaf_l2
+        self.leaf_max_iter = leaf_max_iter
 
         self.cat_ = len(categories) > 0
         self.rng_ = np.random.default_rng(random_state)
@@ -126,6 +128,7 @@ cdef class TreeClassifier:
         self.linear_leaf = params.get('linear_leaf', False)
         # Accept legacy 'leaf_ridge' key for pickles produced before the rename.
         self.leaf_l2 = params.get('leaf_l2', params.get('leaf_ridge', 0.0))
+        self.leaf_max_iter = params.get('leaf_max_iter', 100)
 
         self.cat_ = params.get('cat_', False)
         self.rng_ = np.random.default_rng(self.random_state)
@@ -264,6 +267,7 @@ cdef class TreeClassifier:
                     self.numeric_features_,
                     self.n_numeric_features_,
                     self.leaf_l2,
+                    self.leaf_max_iter,
                     n_samples,
                     self.n_classes,
                     self.task,

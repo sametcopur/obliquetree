@@ -136,6 +136,7 @@ cpdef dict export_tree(TreeClassifier tree):
         'cat_': tree.cat_,
         'linear_leaf': tree.linear_leaf,
         'leaf_l2': tree.leaf_l2,
+        'leaf_max_iter': tree.leaf_max_iter,
         'numeric_features': numeric_features,
     }
     

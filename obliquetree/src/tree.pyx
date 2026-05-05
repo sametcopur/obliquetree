@@ -1049,6 +1049,7 @@ cdef bint _fit_multinomial(
     const double[::1] sample_weight,
     const int K,
     const double leaf_l2,
+    const int max_iter,
     double* coef_out,
     double* intercept_out,
 ) noexcept nogil:
@@ -1058,7 +1059,6 @@ cdef bint _fit_multinomial(
     cdef int dim = d + 1
     cdef int K_free = K - 1
     cdef int total = K_free * dim
-    cdef int max_iter = 50
     cdef double tol = 1e-6
 
     if K < 2:
@@ -1226,6 +1226,7 @@ cdef bint _fit_logistic_one(
     const double[::1] sample_weight,
     const int target_class,
     const double leaf_l2,
+    const int max_iter,
     double* coef_out,
     double* intercept_out,
     double* x_mean,
@@ -1243,7 +1244,6 @@ cdef bint _fit_logistic_one(
     cdef double w, target_i, eta, p, dp, intercept, intercept_new
     cdef double diff, max_diff
     cdef double eps = 1e-9
-    cdef int max_iter = 25
     cdef double tol = 1e-6
 
     if n_leaf_samples < d + 1:
@@ -1343,6 +1343,7 @@ cdef void _fit_one_leaf(
     const int n_classes,
     const bint task,
     const double leaf_l2,
+    const int leaf_max_iter,
     const int* sample_indices,
     const int n_leaf_samples,
     double* x_mean,
@@ -1424,7 +1425,7 @@ cdef void _fit_one_leaf(
         # Binary classification: logistic IRLS
         if not _fit_logistic_one(
             X, sample_indices, n_leaf_samples, numeric_features, d,
-            y, sample_weight, -1, leaf_l2,
+            y, sample_weight, -1, leaf_l2, leaf_max_iter,
             coef_buf, &intercept_val,
             x_mean, G, rhs, w_buf, z_buf, coef_new_buf,
         ):
@@ -1442,7 +1443,7 @@ cdef void _fit_one_leaf(
         # Multiclass: proper softmax regression via Newton-Raphson
         if not _fit_multinomial(
             X, sample_indices, n_leaf_samples, numeric_features, d,
-            y, sample_weight, n_classes, leaf_l2,
+            y, sample_weight, n_classes, leaf_l2, leaf_max_iter,
             leaf.leaf_coef, leaf.leaf_intercept_buf,
         ):
             free(leaf.leaf_coef)
@@ -1465,6 +1466,7 @@ cdef void _walk_and_fit(
     const int n_classes,
     const bint task,
     const double leaf_l2,
+    const int leaf_max_iter,
     int* sample_indices,
     const int n_node_samples,
     double* x_mean,
@@ -1488,6 +1490,7 @@ cdef void _walk_and_fit(
             n_classes,
             task,
             leaf_l2,
+            leaf_max_iter,
             sample_indices,
             n_node_samples,
             x_mean,
@@ -1516,13 +1519,13 @@ cdef void _walk_and_fit(
 
     _walk_and_fit(
         node.left, X, y, sample_weight,
-        numeric_features, d, n_classes, task, leaf_l2,
+        numeric_features, d, n_classes, task, leaf_l2, leaf_max_iter,
         sample_indices, left_count,
         x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
     )
     _walk_and_fit(
         node.right, X, y, sample_weight,
-        numeric_features, d, n_classes, task, leaf_l2,
+        numeric_features, d, n_classes, task, leaf_l2, leaf_max_iter,
         sample_indices + left_count, n_node_samples - left_count,
         x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
     )
@@ -1536,6 +1539,7 @@ cdef void fit_linear_leaves(
     const int* numeric_features,
     const int n_numeric_features,
     const double leaf_l2,
+    const int leaf_max_iter,
     const int n_samples,
     const int n_classes,
     const bint task,
@@ -1581,7 +1585,7 @@ cdef void fit_linear_leaves(
 
     _walk_and_fit(
         root, X, y, sample_weight,
-        numeric_features, d, n_classes, task, leaf_l2,
+        numeric_features, d, n_classes, task, leaf_l2, leaf_max_iter,
         sample_indices, n_samples,
         x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
     )

@@ -94,6 +94,13 @@ class BaseTree(TreeClassifier):
         diagonal when ``linear_leaf=True``. See ``Notes`` for the regression
         vs. classification semantics.
 
+    leaf_max_iter : int
+        Maximum Newton / IRLS iterations per leaf when ``linear_leaf=True``.
+        Each iteration solves a Cholesky system; iteration stops early when
+        the parameter step falls below ``1e-6`` (in absolute value). Used
+        only for binary logistic IRLS and multiclass softmax Newton;
+        regression OLS is closed-form and does not iterate.
+
     Notes
     -----
     **Linear leaves (``linear_leaf=True``)**
@@ -119,19 +126,22 @@ class BaseTree(TreeClassifier):
       samples, solved in closed form via a centered Cholesky decomposition.
       Prediction: ``intercept + Σ coef · x_numeric``.
     - **Binary classification**: weighted logistic regression fit by
-      iteratively reweighted least squares (IRLS) for a fixed 25 iterations
-      (each iteration is the same Cholesky solve as the regression case).
-      Prediction: ``sigmoid(intercept + Σ coef · x_numeric)`` interpreted as
+      iteratively reweighted least squares (IRLS) for up to
+      ``leaf_max_iter`` iterations (each iteration is the same Cholesky
+      solve as the regression case). Prediction:
+      ``sigmoid(intercept + Σ coef · x_numeric)`` interpreted as
       ``P(class = 1)``.
     - **Multiclass classification (n_classes > 2)**: multinomial softmax
       regression with K-1 reference-class parametrization (the last class
       logit is fixed at 0 to remove the rank-1 redundancy of the symmetric
       K-class form). Fit by Newton-Raphson on the full (K-1)·(d+1) Hessian
-      for a fixed 50 iterations. Prediction: ``softmax`` over the K logits.
+      for up to ``leaf_max_iter`` iterations. Prediction: ``softmax`` over
+      the K logits.
 
-    The Newton/IRLS schemes use a fixed iteration count and accept the last
-    finite iterate; convergence to a tolerance is not strictly required. A
-    leaf falls back to the constant prediction (mean / frequency) when:
+    Both iterative schemes break early once the largest absolute parameter
+    step falls below ``1e-6``; the last finite iterate is accepted, so
+    reaching ``leaf_max_iter`` without strict convergence is not an error.
+    A leaf falls back to the constant prediction (mean / frequency) when:
 
     - the leaf has fewer samples than coefficients (``n_samples < d + 1``),
     - the Hessian/Gram matrix is singular (e.g. correlated numeric features
@@ -169,6 +179,7 @@ class BaseTree(TreeClassifier):
         relative_change: float,
         linear_leaf: bool = False,
         leaf_l2: float = 1e-6,
+        leaf_max_iter: int = 100,
     ) -> None:
         # Validate and assign parameters
         self.task = task
@@ -191,6 +202,7 @@ class BaseTree(TreeClassifier):
         self.categories = self._validate_categories(categories)
         self.linear_leaf = self._validate_linear_leaf(linear_leaf)
         self.leaf_l2 = self._validate_leaf_l2(leaf_l2)
+        self.leaf_max_iter = self._validate_leaf_max_iter(leaf_max_iter)
         self._fit = False
         self._categories: dict[int, NDArray]
 
@@ -213,6 +225,7 @@ class BaseTree(TreeClassifier):
             1,
             self.linear_leaf,
             self.leaf_l2,
+            self.leaf_max_iter,
         )
 
     def __getstate__(self):
@@ -255,7 +268,8 @@ class BaseTree(TreeClassifier):
             f"max_iter={getattr(self, 'max_iter', None)}, "
             f"relative_change={getattr(self, 'relative_change', None)}, "
             f"linear_leaf={getattr(self, 'linear_leaf', None)}, "
-            f"leaf_l2={getattr(self, 'leaf_l2', None)}"
+            f"leaf_l2={getattr(self, 'leaf_l2', None)}, "
+            f"leaf_max_iter={getattr(self, 'leaf_max_iter', None)}"
         )
         return f"{self.__class__.__name__}({param_str})"
 
@@ -377,6 +391,13 @@ class BaseTree(TreeClassifier):
         if leaf_l2 < 0.0:
             raise ValueError("leaf_l2 must be >= 0.0")
         return float(leaf_l2)
+
+    def _validate_leaf_max_iter(self, leaf_max_iter: int) -> int:
+        if not isinstance(leaf_max_iter, int) or isinstance(leaf_max_iter, bool):
+            raise ValueError("leaf_max_iter must be an integer")
+        if leaf_max_iter < 1:
+            raise ValueError("leaf_max_iter must be >= 1")
+        return leaf_max_iter
 
     def _coerce_feature_matrix(self, X: ArrayLike) -> NDArray:
         X = np.asarray(X, order="F", dtype=np.float64)
@@ -676,6 +697,7 @@ class Classifier(BaseTree):
         relative_change: float = 0.001,
         linear_leaf: bool = False,
         leaf_l2: float = 1e-6,
+        leaf_max_iter: int = 100,
     ):
         """
         A decision tree classifier supporting both traditional axis-aligned and oblique splits.
@@ -767,6 +789,14 @@ class Classifier(BaseTree):
             without it), so ``leaf_l2=0.0`` is effectively ``1e-10`` for
             classifiers. A larger value (e.g. ``0.1`` - ``1.0``) often
             improves probability calibration without harming accuracy.
+
+        leaf_max_iter : int, default=100
+            Maximum IRLS / Newton iterations per leaf. Iteration stops
+            early when the largest absolute parameter step falls below
+            ``1e-6``; with well-conditioned data convergence is typically
+            reached in 5-15 iterations. Increase (e.g. to ``500``) for
+            harder leaves where the default cap might leave the iterate
+            short of the optimum.
         """
         super().__init__(
             task=False,
@@ -785,6 +815,7 @@ class Classifier(BaseTree):
             relative_change=relative_change,
             linear_leaf=linear_leaf,
             leaf_l2=leaf_l2,
+            leaf_max_iter=leaf_max_iter,
         )
 
     def fit(
@@ -878,6 +909,7 @@ class Regressor(BaseTree):
         relative_change: float = 0.001,
         linear_leaf: bool = False,
         leaf_l2: float = 1e-6,
+        leaf_max_iter: int = 100,
     ):
         """
         A decision tree regressor supporting both traditional axis-aligned and oblique splits.
@@ -961,6 +993,11 @@ class Regressor(BaseTree):
             numeric features the affected leaf falls back to the mean
             instead. Pass a small positive value (e.g. ``1e-8``) to
             keep the fit on correlated features.
+
+        leaf_max_iter : int, default=100
+            Unused for regression (OLS is closed-form), kept for API
+            symmetry with ``Classifier`` so ``Regressor`` and
+            ``Classifier`` share the same constructor surface.
         """
         super().__init__(
             task=True,
@@ -979,6 +1016,7 @@ class Regressor(BaseTree):
             relative_change=relative_change,
             linear_leaf=linear_leaf,
             leaf_l2=leaf_l2,
+            leaf_max_iter=leaf_max_iter,
         )
 
     def fit(

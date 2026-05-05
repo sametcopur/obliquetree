@@ -23,6 +23,7 @@ cdef class TreeClassifier:
     cdef public int n_features
     cdef public bint linear_leaf
     cdef public double leaf_l2
+    cdef public int leaf_max_iter
     cdef int* numeric_features_
     cdef int n_numeric_features_
 

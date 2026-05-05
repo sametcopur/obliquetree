@@ -50,6 +50,7 @@ cdef void fit_linear_leaves(
     const int* numeric_features,
     const int n_numeric_features,
     const double leaf_l2,
+    const int leaf_max_iter,
     const int n_samples,
     const int n_classes,
     const bint task,
