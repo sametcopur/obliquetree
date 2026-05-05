@@ -181,6 +181,107 @@ cdef double fun_and_grad_nogil(
     return loss
 
 
+cdef double _ols_pair_solve_nogil(
+    const double* X_pair,        # (N x d) column-major (lda=N)
+    const double* y,             # length N
+    const double* sample_weight, # length N
+    const double total_weight,
+    const Py_ssize_t N, const Py_ssize_t d,
+    const double ridge,
+    double* w_out,               # length d
+) noexcept nogil:
+    """No-intercept weighted ridge OLS via Cholesky for the regression
+    linear-oblique path. Solves
+
+        (X^T W X + ridge * I) w = X^T W y
+
+    and returns the L-BFGS-comparable loss
+
+        0.5 * sum((sw / total_weight) * (y - X w)^2)
+
+    Returns INFINITY if Cholesky fails (caller falls back to L-BFGS).
+    The objective matches `fun_and_grad_linear_reg_nogil`: no intercept
+    column, so projection scaling is preserved exactly.
+    """
+    cdef Py_ssize_t i, a, b
+    cdef Py_ssize_t lda = N
+    cdef double w_i, x_a, x_b, sum_val, residual, loss, pivot
+    cdef double* G = <double*>malloc(d * d * sizeof(double))
+    cdef double* rhs = <double*>malloc(d * sizeof(double))
+
+    if G == NULL or rhs == NULL:
+        if G != NULL:
+            free(G)
+        if rhs != NULL:
+            free(rhs)
+        return INFINITY
+
+    memset(G, 0, d * d * sizeof(double))
+    memset(rhs, 0, d * sizeof(double))
+
+    # Accumulate Gram + rhs (lower triangle of G).
+    for i in range(N):
+        w_i = sample_weight[i]
+        for a in range(d):
+            x_a = X_pair[a * lda + i]
+            rhs[a] = rhs[a] + w_i * x_a * y[i]
+            for b in range(a + 1):
+                x_b = X_pair[b * lda + i]
+                G[a * d + b] = G[a * d + b] + w_i * x_a * x_b
+
+    # Mirror upper triangle.
+    for a in range(d):
+        for b in range(a + 1, d):
+            G[a * d + b] = G[b * d + a]
+
+    if ridge > 0.0:
+        for a in range(d):
+            G[a * d + a] = G[a * d + a] + ridge
+
+    # In-place Cholesky decomposition (lower triangular).
+    for a in range(d):
+        for b in range(a + 1):
+            sum_val = G[a * d + b]
+            for i in range(b):
+                sum_val = sum_val - G[a * d + i] * G[b * d + i]
+            if a == b:
+                if not (sum_val > 0.0):
+                    free(G); free(rhs)
+                    return INFINITY
+                pivot = sum_val ** 0.5
+                G[a * d + a] = pivot
+            else:
+                G[a * d + b] = sum_val / G[b * d + b]
+
+    # Forward substitution: L y' = rhs, write y' into w_out.
+    for a in range(d):
+        sum_val = rhs[a]
+        for i in range(a):
+            sum_val = sum_val - G[a * d + i] * w_out[i]
+        w_out[a] = sum_val / G[a * d + a]
+
+    # Back substitution: L^T w = y'.
+    a = d - 1
+    while a >= 0:
+        sum_val = w_out[a]
+        for i in range(a + 1, d):
+            sum_val = sum_val - G[i * d + a] * w_out[i]
+        w_out[a] = sum_val / G[a * d + a]
+        a -= 1
+
+    # Loss for ranking (matches L-BFGS objective scale).
+    loss = 0.0
+    for i in range(N):
+        residual = y[i]
+        for a in range(d):
+            residual = residual - w_out[a] * X_pair[a * lda + i]
+        loss = loss + 0.5 * (sample_weight[i] / total_weight) * residual * residual
+
+    free(G)
+    free(rhs)
+    return loss
+
+
 cdef double fun_and_grad_linear_reg_nogil(
     const double* X, const double* y, const double* sample_weight,
     double* w,
@@ -1358,23 +1459,37 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
         memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
 
         pair_best_f = INFINITY
-        for ci in range(multi_range):
-            memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
-            memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
-            memset(w.rho, 0, lbfgs_m * sizeof(double))
-            f_val = lbfgs_minimize_nogil(
-                task, n_classes, <double>ci, linear,
-                w.x_work, w.X_pair, y_ptr, sw_ptr, sum_sw,
-                N, n_pair, gamma, 1e-6, lbfgs_m,
-                maxiter, relative_change, 1e-5, 20,
-                w.grad, w.grad_new, w.direction, w.x_new,
-                w.s_hist, w.y_hist, w.rho, w.alpha_buf,
-                w.buf_z, w.buf_p, w.buf_dp_dz,
-                w.buf1, w.buf2, w.buf3,
-                w.buf4, w.buf5, w.buf6, w.buf7)
-            if f_val < pair_best_f:
+
+        # Regression-linear path: closed-form weighted ridge OLS via
+        # Cholesky. Same no-intercept objective as the L-BFGS path, just
+        # solved exactly in O(N d^2 + d^3) instead of iteratively.
+        if task == 1 and linear:
+            f_val = _ols_pair_solve_nogil(
+                w.X_pair, y_ptr, sw_ptr, sum_sw,
+                N, n_pair, 1e-10, w.x_work,
+            )
+            if f_val < INFINITY:
                 pair_best_f = f_val
                 memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
+        if pair_best_f == INFINITY:
+            for ci in range(multi_range):
+                memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                memset(w.rho, 0, lbfgs_m * sizeof(double))
+                f_val = lbfgs_minimize_nogil(
+                    task, n_classes, <double>ci, linear,
+                    w.x_work, w.X_pair, y_ptr, sw_ptr, sum_sw,
+                    N, n_pair, gamma, 1e-6, lbfgs_m,
+                    maxiter, relative_change, 1e-5, 20,
+                    w.grad, w.grad_new, w.direction, w.x_new,
+                    w.s_hist, w.y_hist, w.rho, w.alpha_buf,
+                    w.buf_z, w.buf_p, w.buf_dp_dz,
+                    w.buf1, w.buf2, w.buf3,
+                    w.buf4, w.buf5, w.buf6, w.buf7)
+                if f_val < pair_best_f:
+                    pair_best_f = f_val
+                    memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
 
         if pair_best_f < w.best_loss:
             w.best_loss = pair_best_f
