@@ -1616,21 +1616,52 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
             memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
 
             pair_best_f = INFINITY
-            for ci in range(multi_range):
-                memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
-                memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
-                memset(w.rho, 0, lbfgs_m * sizeof(double))
-                f_val = proxy_screen_nogil(
-                    task, n_classes, <double>ci, linear,
-                    w.x_work, w.X_pair, y_screen_ptr, sw_screen_ptr, screen_sum_sw,
-                    screen_N, n_pair, gamma, 1e-6, 1e-5,
-                    w.grad, w.grad_new, w.x_new,
-                    w.buf_z, w.buf_p, w.buf_dp_dz,
-                    w.buf1, w.buf2, w.buf3,
-                    w.buf4, w.buf5, w.buf6, w.buf7)
-                if f_val < pair_best_f:
+
+            # Linear paths: rank pairs by the EXACT closed-form / IRLS
+            # solution, not the single-step proxy. d=n_pair is small so
+            # this is essentially free and removes the bias of pairs whose
+            # random-init proxy loss happened to be misleadingly bad.
+            if task == 1 and linear:
+                f_val = _ols_pair_solve_nogil(
+                    w.X_pair, y_screen_ptr, sw_screen_ptr, screen_sum_sw,
+                    screen_N, n_pair, 1e-10, w.x_work,
+                )
+                if f_val < INFINITY:
                     pair_best_f = f_val
                     memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+            elif task == 0 and linear:
+                for ci in range(multi_range):
+                    init_x0_deterministic(w.x_work, n_pair, rng_seed, pi)
+                    f_val = _irls_pair_solve_nogil(
+                        w.X_pair, y_screen_ptr, sw_screen_ptr, screen_sum_sw,
+                        screen_N, n_pair, <double>ci,
+                        maxiter, 1e-7, 1e-10, w.x_work,
+                    )
+                    if f_val < pair_best_f:
+                        pair_best_f = f_val
+                        memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
+            # Non-linear paths and any linear pair where the closed-form
+            # / IRLS attempt failed (left pair_best_f == INFINITY) drop
+            # back to the original L-BFGS proxy step for ranking.
+            if pair_best_f == INFINITY:
+                for ci in range(multi_range):
+                    init_x0_deterministic(w.x_work, n_pair, rng_seed, pi)
+                    memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                    memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
+                    memset(w.rho, 0, lbfgs_m * sizeof(double))
+                    f_val = proxy_screen_nogil(
+                        task, n_classes, <double>ci, linear,
+                        w.x_work, w.X_pair, y_screen_ptr, sw_screen_ptr, screen_sum_sw,
+                        screen_N, n_pair, gamma, 1e-6, 1e-5,
+                        w.grad, w.grad_new, w.x_new,
+                        w.buf_z, w.buf_p, w.buf_dp_dz,
+                        w.buf1, w.buf2, w.buf3,
+                        w.buf4, w.buf5, w.buf6, w.buf7)
+                    if f_val < pair_best_f:
+                        pair_best_f = f_val
+                        memcpy(w.pair_best_weights, w.x_work, n_pair * sizeof(double))
+
             screen_losses[pi] = pair_best_f
             memcpy(&screen_weights[pi * n_pair], w.pair_best_weights, n_pair * sizeof(double))
 
@@ -1720,17 +1751,21 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
 
         # Classification-linear path (binary + OvR multiclass): damped
         # IRLS via weighted Cholesky for the survivor full-optimization
-        # step only. (The cheap proxy_screen_nogil pass earlier still
-        # uses an L-BFGS-style single-step proxy, so the linear path is
-        # not entirely L-BFGS-free.) Iteration cap inherits the public
-        # ``max_iter`` parameter; the parameter-step tolerance is a
-        # dedicated internal IRLS constant — `relative_change` from the
-        # public API is L-BFGS function-relative and is not reused here.
-        # Per-class fallback: if IRLS fails for one OvR class, run
-        # L-BFGS for THAT class only so the OvR ranking does not silently
-        # skip a class candidate.
+        # step. Each OvR class candidate is fit independently from the
+        # original screen warm start (or deterministic init) — without
+        # this re-init, ci=k's IRLS would inherit ci=(k-1)'s optimum,
+        # which is convex-equivalent in the limit but biases speed and
+        # rounding behavior across class targets. Per-class fallback:
+        # if IRLS fails for one OvR class, run L-BFGS for THAT class
+        # only so the OvR ranking does not silently skip a candidate.
         elif task == 0 and linear:
             for ci in range(multi_range):
+                if do_screen:
+                    memcpy(w.x_work,
+                           &screen_weights[real_pi * n_pair],
+                           n_pair * sizeof(double))
+                else:
+                    init_x0_deterministic(w.x_work, n_pair, rng_seed, real_pi)
                 f_val = _irls_pair_solve_nogil(
                     w.X_pair, y_ptr, sw_ptr, sum_sw,
                     N, n_pair, <double>ci,
@@ -1738,7 +1773,7 @@ cdef tuple[double*, int*] _analyze_from_pairs_compact(
                 )
                 if f_val == INFINITY:
                     # IRLS preserved w.x_work (warm start) on failure;
-                    # run L-BFGS from the same start for this class.
+                    # run L-BFGS from the same warm start for this class.
                     memset(w.s_hist, 0, lbfgs_m * n_pair * sizeof(double))
                     memset(w.y_hist, 0, lbfgs_m * n_pair * sizeof(double))
                     memset(w.rho, 0, lbfgs_m * sizeof(double))
