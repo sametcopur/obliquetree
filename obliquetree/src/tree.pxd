@@ -10,7 +10,7 @@ cdef struct TreeNode:
     double threshold
     TreeNode* left
     TreeNode* right
-    int n_pair 
+    int n_pair
     double* x
     int* pair
     int missing_go_left
@@ -18,6 +18,10 @@ cdef struct TreeNode:
     int* categories_go_left
     double impurity
     int n_samples
+    double* leaf_coef
+    double* leaf_intercept_buf
+    int leaf_n_coef
+    int leaf_n_models
 
 cdef struct CategoryStat:
     double value
@@ -32,6 +36,23 @@ cdef void predict(
     double[:, ::1] out,
     const int n_samples,
     const int n_classes,
+    const bint linear_leaf,
+    const int* numeric_features,
+    const int n_numeric_features,
+    const bint clip_to_unit,
+) noexcept nogil
+
+cdef void fit_linear_leaves(
+    TreeNode* root,
+    const double[::1, :] X,
+    const double[::1] y,
+    const double[::1] sample_weight,
+    const int* numeric_features,
+    const int n_numeric_features,
+    const double leaf_ridge,
+    const int n_samples,
+    const int n_classes,
+    const bint task,
 ) noexcept nogil
 
 cdef void apply(

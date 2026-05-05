@@ -1,8 +1,9 @@
 from cython.parallel cimport prange
 
 from libc.limits cimport INT_MAX, INT_MIN
-from libc.math cimport INFINITY
+from libc.math cimport INFINITY, exp, log, fabs
 from libc.stdlib cimport calloc, malloc, free
+from libc.string cimport memset
 
 from .metric cimport (
     calculate_impurity,
@@ -415,6 +416,10 @@ cdef TreeNode* build_tree_recursive(
     node.n_samples = n_samples
     node.n_classes = n_classes
     node.value_multiclass = NULL
+    node.leaf_coef = NULL
+    node.leaf_intercept_buf = NULL
+    node.leaf_n_coef = 0
+    node.leaf_n_models = 0
 
     if n_classes > 2:
         calculate_node_value_multiclass(
@@ -840,16 +845,745 @@ cdef void predict(
     double[:, ::1] out,
     const int n_samples,
     const int n_classes,
+    const bint linear_leaf,
+    const int* numeric_features,
+    const int n_numeric_features,
+    const bint clip_to_unit,
 ) noexcept nogil:
-    cdef int i
-    cdef int j
+    cdef int i, j, k
     cdef const TreeNode* leaf
-
+    cdef double val
+    cdef double x_val
+    cdef bint bad_seen
+    cdef double max_logit, sum_exp
+    cdef int d_coef
     cdef bint use_parallel = n_samples >= 1024
+    cdef bint use_linear = linear_leaf
+
     for i in prange(n_samples, nogil=True, schedule="static", use_threads_if=use_parallel):
         leaf = _find_leaf(node, X, i)
-        if n_classes <= 2:
-            out[i, 0] = leaf.value
+
+        if use_linear and leaf.leaf_coef != NULL and leaf.leaf_n_models > 0:
+            d_coef = leaf.leaf_n_coef
+            bad_seen = False
+            for j in range(n_numeric_features):
+                x_val = X[i, numeric_features[j]]
+                if x_val != x_val or x_val >= INFINITY or x_val <= -INFINITY:
+                    bad_seen = True
+                    break
+
+            if bad_seen:
+                if n_classes <= 2:
+                    out[i, 0] = leaf.value
+                else:
+                    for j in range(n_classes):
+                        out[i, j] = leaf.value_multiclass[j]
+            else:
+                if n_classes == 1:
+                    val = leaf.leaf_intercept_buf[0]
+                    for j in range(d_coef):
+                        val = val + leaf.leaf_coef[j] * X[i, numeric_features[j]]
+                    out[i, 0] = val
+                elif n_classes == 2:
+                    val = leaf.leaf_intercept_buf[0]
+                    for j in range(d_coef):
+                        val = val + leaf.leaf_coef[j] * X[i, numeric_features[j]]
+                    val = _sigmoid(val)
+                    if clip_to_unit:
+                        if val < 0.0:
+                            val = 0.0
+                        elif val > 1.0:
+                            val = 1.0
+                    out[i, 0] = val
+                else:
+                    max_logit = -INFINITY
+                    for k in range(n_classes):
+                        val = leaf.leaf_intercept_buf[k]
+                        for j in range(d_coef):
+                            val = val + leaf.leaf_coef[k * d_coef + j] * X[i, numeric_features[j]]
+                        out[i, k] = val
+                        if val > max_logit:
+                            max_logit = val
+                    sum_exp = 0.0
+                    for k in range(n_classes):
+                        val = exp(out[i, k] - max_logit)
+                        out[i, k] = val
+                        sum_exp = sum_exp + val
+                    if sum_exp > 0.0:
+                        for k in range(n_classes):
+                            out[i, k] = out[i, k] / sum_exp
         else:
-            for j in range(n_classes):
-                out[i, j] = leaf.value_multiclass[j]
+            if n_classes <= 2:
+                out[i, 0] = leaf.value
+            else:
+                for j in range(n_classes):
+                    out[i, j] = leaf.value_multiclass[j]
+
+
+cdef bint _solve_cholesky(double* G, double* b, double* coef, const int d) noexcept nogil:
+    """In-place Cholesky decomposition of SPD matrix G (d x d, row-major) and
+    solve G @ coef = b. Lower-triangular factor overwrites G. Returns True on
+    success, False if a non-positive pivot is encountered."""
+    cdef int i, j, k
+    cdef double sum_val
+    cdef double pivot
+    cdef double y_val
+
+    for i in range(d):
+        for j in range(i + 1):
+            sum_val = G[i * d + j]
+            for k in range(j):
+                sum_val = sum_val - G[i * d + k] * G[j * d + k]
+            if i == j:
+                if not (sum_val > 0.0):
+                    return False
+                pivot = sum_val ** 0.5
+                G[i * d + i] = pivot
+            else:
+                G[i * d + j] = sum_val / G[j * d + j]
+
+    for i in range(d):
+        sum_val = b[i]
+        for k in range(i):
+            sum_val = sum_val - G[i * d + k] * coef[k]
+        coef[i] = sum_val / G[i * d + i]
+
+    i = d - 1
+    while i >= 0:
+        sum_val = coef[i]
+        for k in range(i + 1, d):
+            sum_val = sum_val - G[k * d + i] * coef[k]
+        coef[i] = sum_val / G[i * d + i]
+        i = i - 1
+
+    return True
+
+
+cdef inline double _sigmoid(double x) noexcept nogil:
+    cdef double ex
+    if x >= 0.0:
+        ex = exp(-x)
+        return 1.0 / (1.0 + ex)
+    ex = exp(x)
+    return ex / (1.0 + ex)
+
+
+cdef bint _centered_weighted_ols(
+    const double[::1, :] X,
+    const int* sample_indices,
+    const int n_leaf_samples,
+    const int* numeric_features,
+    const int d,
+    const double* w_per_sample,
+    const double* z_per_sample,
+    const double leaf_ridge,
+    double* x_mean,
+    double* G,
+    double* rhs,
+    double* coef_out,
+    double* intercept_out,
+) noexcept nogil:
+    cdef int i, j, k, idx
+    cdef double w_sum = 0.0
+    cdef double w, z_mean = 0.0, dxj, dxk, zc
+
+    if d <= 0:
+        return False
+
+    memset(x_mean, 0, d * sizeof(double))
+    memset(G, 0, d * d * sizeof(double))
+    memset(rhs, 0, d * sizeof(double))
+
+    for i in range(n_leaf_samples):
+        idx = sample_indices[i]
+        w = w_per_sample[i]
+        w_sum = w_sum + w
+        z_mean = z_mean + w * z_per_sample[i]
+        for j in range(d):
+            x_mean[j] = x_mean[j] + w * X[idx, numeric_features[j]]
+
+    if w_sum <= 0.0:
+        return False
+
+    z_mean = z_mean / w_sum
+    for j in range(d):
+        x_mean[j] = x_mean[j] / w_sum
+
+    for i in range(n_leaf_samples):
+        idx = sample_indices[i]
+        w = w_per_sample[i]
+        zc = z_per_sample[i] - z_mean
+        for j in range(d):
+            dxj = X[idx, numeric_features[j]] - x_mean[j]
+            rhs[j] = rhs[j] + w * dxj * zc
+            for k in range(j + 1):
+                dxk = X[idx, numeric_features[k]] - x_mean[k]
+                G[j * d + k] = G[j * d + k] + w * dxj * dxk
+
+    for j in range(d):
+        for k in range(j + 1, d):
+            G[j * d + k] = G[k * d + j]
+
+    if leaf_ridge > 0.0:
+        for j in range(d):
+            G[j * d + j] = G[j * d + j] + leaf_ridge
+
+    if not _solve_cholesky(G, rhs, coef_out, d):
+        return False
+
+    intercept_out[0] = z_mean
+    for j in range(d):
+        intercept_out[0] = intercept_out[0] - coef_out[j] * x_mean[j]
+
+    return True
+
+
+cdef bint _fit_multinomial(
+    const double[::1, :] X,
+    const int* sample_indices,
+    const int n_leaf_samples,
+    const int* numeric_features,
+    const int d,
+    const double[::1] y,
+    const double[::1] sample_weight,
+    const int K,
+    const double leaf_ridge,
+    double* coef_out,
+    double* intercept_out,
+) noexcept nogil:
+    # K-1 reference-class parametrization: free parameters for classes 0..K-2,
+    # last class fixed at logit 0. Eliminates the rank-1 redundancy of the
+    # symmetric K-class form so the Hessian is non-singular at zero ridge.
+    cdef int dim = d + 1
+    cdef int K_free = K - 1
+    cdef int total = K_free * dim
+    cdef int max_iter = 50
+    cdef double tol = 1e-6
+
+    if K < 2:
+        return False
+    if total <= 0:
+        return False
+
+    cdef double* H = <double*>malloc(total * total * sizeof(double))
+    cdef double* grad = <double*>malloc(total * sizeof(double))
+    cdef double* delta = <double*>malloc(total * sizeof(double))
+    cdef double* beta = <double*>malloc(total * sizeof(double))
+    cdef double* p_buf = <double*>malloc(n_leaf_samples * K * sizeof(double))
+    cdef double* x_aug = <double*>malloc(dim * sizeof(double))
+
+    cdef bint alloc_ok = (H != NULL and grad != NULL and delta != NULL
+                          and beta != NULL and p_buf != NULL and x_aug != NULL)
+    if not alloc_ok:
+        if H != NULL: free(H)
+        if grad != NULL: free(grad)
+        if delta != NULL: free(delta)
+        if beta != NULL: free(beta)
+        if p_buf != NULL: free(p_buf)
+        if x_aug != NULL: free(x_aug)
+        return False
+
+    cdef int i, j, idx, k, l, a, b, it
+    cdef double w, eta, max_eta, sum_exp, pk, pl, yk, coeff
+    cdef double max_step
+    cdef double damping
+    cdef double eff_ridge
+    cdef int label_int
+    cdef bint cholesky_ok = True
+    cdef bint converged = False
+    cdef double bv
+
+    eff_ridge = leaf_ridge
+    if eff_ridge < 1e-10:
+        eff_ridge = 1e-10
+
+    memset(beta, 0, total * sizeof(double))
+
+    for it in range(max_iter):
+        memset(grad, 0, total * sizeof(double))
+        memset(H, 0, total * total * sizeof(double))
+
+        for i in range(n_leaf_samples):
+            idx = sample_indices[i]
+            w = sample_weight[idx]
+            x_aug[0] = 1.0
+            for j in range(d):
+                x_aug[j + 1] = X[idx, numeric_features[j]]
+
+            # Logits: free for k in 0..K_free-1, fixed 0 for class K-1.
+            max_eta = 0.0
+            for k in range(K_free):
+                eta = 0.0
+                for j in range(dim):
+                    eta = eta + beta[k * dim + j] * x_aug[j]
+                p_buf[i * K + k] = eta
+                if eta > max_eta:
+                    max_eta = eta
+            p_buf[i * K + K_free] = 0.0
+
+            sum_exp = 0.0
+            for k in range(K):
+                eta = exp(p_buf[i * K + k] - max_eta)
+                p_buf[i * K + k] = eta
+                sum_exp = sum_exp + eta
+            if sum_exp > 0.0:
+                for k in range(K):
+                    p_buf[i * K + k] = p_buf[i * K + k] / sum_exp
+
+            label_int = <int>y[idx]
+
+            for k in range(K_free):
+                pk = p_buf[i * K + k]
+                yk = 1.0 if k == label_int else 0.0
+                coeff = w * (pk - yk)
+                for a in range(dim):
+                    grad[k * dim + a] = grad[k * dim + a] + coeff * x_aug[a]
+
+            for k in range(K_free):
+                pk = p_buf[i * K + k]
+                for l in range(K_free):
+                    pl = p_buf[i * K + l]
+                    if k == l:
+                        coeff = w * pk * (1.0 - pl)
+                    else:
+                        coeff = -w * pk * pl
+                    if coeff == 0.0:
+                        continue
+                    for a in range(dim):
+                        for b in range(dim):
+                            H[(k * dim + a) * total + (l * dim + b)] = (
+                                H[(k * dim + a) * total + (l * dim + b)]
+                                + coeff * x_aug[a] * x_aug[b]
+                            )
+
+        # Apply ridge (with internal floor for rank-deficient X).
+        for k in range(K_free):
+            for a in range(1, dim):
+                H[(k * dim + a) * total + (k * dim + a)] = (
+                    H[(k * dim + a) * total + (k * dim + a)] + eff_ridge
+                )
+
+        if not _solve_cholesky(H, grad, delta, total):
+            cholesky_ok = False
+            break
+
+        max_step = 0.0
+        for j in range(total):
+            if fabs(delta[j]) > max_step:
+                max_step = fabs(delta[j])
+
+        damping = 1.0
+        if max_step > 5.0:
+            damping = 5.0 / max_step
+
+        max_step = 0.0
+        for j in range(total):
+            beta[j] = beta[j] - damping * delta[j]
+            if fabs(damping * delta[j]) > max_step:
+                max_step = fabs(damping * delta[j])
+
+        if max_step < tol:
+            converged = True
+            break
+
+    cdef bint finite_ok = True
+    if cholesky_ok:
+        for j in range(total):
+            bv = beta[j]
+            if bv != bv or bv >= INFINITY or bv <= -INFINITY:
+                finite_ok = False
+                break
+
+    cdef bint result = cholesky_ok and finite_ok and (converged or it > 0)
+
+    if result:
+        for k in range(K_free):
+            intercept_out[k] = beta[k * dim]
+            for j in range(d):
+                coef_out[k * d + j] = beta[k * dim + j + 1]
+        # Reference class K-1 fixed at zero logit.
+        intercept_out[K - 1] = 0.0
+        for j in range(d):
+            coef_out[(K - 1) * d + j] = 0.0
+
+    free(H)
+    free(grad)
+    free(delta)
+    free(beta)
+    free(p_buf)
+    free(x_aug)
+    return result
+
+
+cdef bint _fit_logistic_one(
+    const double[::1, :] X,
+    const int* sample_indices,
+    const int n_leaf_samples,
+    const int* numeric_features,
+    const int d,
+    const double[::1] y_target,
+    const double[::1] sample_weight,
+    const int target_class,
+    const double leaf_ridge,
+    double* coef_out,
+    double* intercept_out,
+    double* x_mean,
+    double* G,
+    double* rhs,
+    double* w_buf,
+    double* z_buf,
+    double* coef_new,
+) noexcept nogil:
+    cdef int i, j, idx, it
+    cdef double y_mean = 0.0
+    cdef double inner_ridge
+    cdef double cv
+    cdef double w_sum = 0.0
+    cdef double w, target_i, eta, p, dp, intercept, intercept_new
+    cdef double diff, max_diff
+    cdef double eps = 1e-9
+    cdef int max_iter = 25
+    cdef double tol = 1e-6
+
+    if n_leaf_samples < d + 1:
+        return False
+
+    for i in range(n_leaf_samples):
+        idx = sample_indices[i]
+        w = sample_weight[idx]
+        if target_class < 0:
+            target_i = y_target[idx]
+        else:
+            target_i = 1.0 if (<int>y_target[idx]) == target_class else 0.0
+        w_sum = w_sum + w
+        y_mean = y_mean + w * target_i
+
+    if w_sum <= 0.0:
+        return False
+    y_mean = y_mean / w_sum
+
+    if y_mean < eps:
+        y_mean = eps
+    elif y_mean > 1.0 - eps:
+        y_mean = 1.0 - eps
+
+    intercept = log(y_mean / (1.0 - y_mean))
+    for j in range(d):
+        coef_out[j] = 0.0
+
+    # Classification IRLS: enforce a tiny ridge floor so the inner OLS
+    # Gram is non-singular even when numeric features are correlated /
+    # rank-deficient. User-supplied ridge is used unchanged when above
+    # the floor.
+    inner_ridge = leaf_ridge
+    if inner_ridge < 1e-10:
+        inner_ridge = 1e-10
+
+    for it in range(max_iter):
+        for i in range(n_leaf_samples):
+            idx = sample_indices[i]
+            if target_class < 0:
+                target_i = y_target[idx]
+            else:
+                target_i = 1.0 if (<int>y_target[idx]) == target_class else 0.0
+
+            eta = intercept
+            for j in range(d):
+                eta = eta + coef_out[j] * X[idx, numeric_features[j]]
+
+            p = _sigmoid(eta)
+            if p < eps:
+                p = eps
+            elif p > 1.0 - eps:
+                p = 1.0 - eps
+            dp = p * (1.0 - p)
+
+            w_buf[i] = sample_weight[idx] * dp
+            z_buf[i] = eta + (target_i - p) / dp
+
+        if not _centered_weighted_ols(
+            X, sample_indices, n_leaf_samples, numeric_features, d,
+            w_buf, z_buf, inner_ridge,
+            x_mean, G, rhs, coef_new, &intercept_new,
+        ):
+            return False
+
+        max_diff = fabs(intercept_new - intercept)
+        for j in range(d):
+            diff = fabs(coef_new[j] - coef_out[j])
+            if diff > max_diff:
+                max_diff = diff
+            coef_out[j] = coef_new[j]
+        intercept = intercept_new
+
+        if max_diff < tol:
+            break
+
+    # Finite check on the last iterate (Newton can blow up on
+    # near-separable data without sufficient ridge).
+    if intercept != intercept or intercept >= INFINITY or intercept <= -INFINITY:
+        return False
+    for j in range(d):
+        cv = coef_out[j]
+        if cv != cv or cv >= INFINITY or cv <= -INFINITY:
+            return False
+
+    intercept_out[0] = intercept
+    return True
+
+
+cdef void _fit_one_leaf(
+    TreeNode* leaf,
+    const double[::1, :] X,
+    const double[::1] y,
+    const double[::1] sample_weight,
+    const int* numeric_features,
+    const int d,
+    const int n_classes,
+    const bint task,
+    const double leaf_ridge,
+    const int* sample_indices,
+    const int n_leaf_samples,
+    double* x_mean,
+    double* G,
+    double* rhs,
+    double* coef_buf,
+    double* w_buf,
+    double* z_buf,
+    double* coef_new_buf,
+) noexcept nogil:
+    cdef int j, k
+    cdef int n_models
+    cdef double intercept_val
+    cdef double w
+    cdef int idx
+    cdef int i
+
+    if leaf.leaf_coef != NULL:
+        free(leaf.leaf_coef)
+        leaf.leaf_coef = NULL
+    if leaf.leaf_intercept_buf != NULL:
+        free(leaf.leaf_intercept_buf)
+        leaf.leaf_intercept_buf = NULL
+    leaf.leaf_n_coef = 0
+    leaf.leaf_n_models = 0
+
+    if d <= 0:
+        return
+    if n_leaf_samples < d + 1:
+        return
+
+    if task == 1:
+        n_models = 1
+    elif n_classes == 2:
+        n_models = 1
+    else:
+        n_models = n_classes
+
+    leaf.leaf_coef = <double*>malloc(n_models * d * sizeof(double))
+    leaf.leaf_intercept_buf = <double*>malloc(n_models * sizeof(double))
+    if leaf.leaf_coef == NULL or leaf.leaf_intercept_buf == NULL:
+        if leaf.leaf_coef != NULL:
+            free(leaf.leaf_coef)
+            leaf.leaf_coef = NULL
+        if leaf.leaf_intercept_buf != NULL:
+            free(leaf.leaf_intercept_buf)
+            leaf.leaf_intercept_buf = NULL
+        return
+
+    if task == 1:
+        # Regression: weighted OLS with z=y, w=sample_weight
+        for i in range(n_leaf_samples):
+            idx = sample_indices[i]
+            w_buf[i] = sample_weight[idx]
+            z_buf[i] = y[idx]
+
+        if not _centered_weighted_ols(
+            X, sample_indices, n_leaf_samples, numeric_features, d,
+            w_buf, z_buf, leaf_ridge,
+            x_mean, G, rhs, coef_buf, &intercept_val,
+        ):
+            free(leaf.leaf_coef)
+            leaf.leaf_coef = NULL
+            free(leaf.leaf_intercept_buf)
+            leaf.leaf_intercept_buf = NULL
+            return
+
+        for j in range(d):
+            leaf.leaf_coef[j] = coef_buf[j]
+        leaf.leaf_intercept_buf[0] = intercept_val
+
+    elif n_classes == 2:
+        # Binary classification: logistic IRLS
+        if not _fit_logistic_one(
+            X, sample_indices, n_leaf_samples, numeric_features, d,
+            y, sample_weight, -1, leaf_ridge,
+            coef_buf, &intercept_val,
+            x_mean, G, rhs, w_buf, z_buf, coef_new_buf,
+        ):
+            free(leaf.leaf_coef)
+            leaf.leaf_coef = NULL
+            free(leaf.leaf_intercept_buf)
+            leaf.leaf_intercept_buf = NULL
+            return
+
+        for j in range(d):
+            leaf.leaf_coef[j] = coef_buf[j]
+        leaf.leaf_intercept_buf[0] = intercept_val
+
+    else:
+        # Multiclass: proper softmax regression via Newton-Raphson
+        if not _fit_multinomial(
+            X, sample_indices, n_leaf_samples, numeric_features, d,
+            y, sample_weight, n_classes, leaf_ridge,
+            leaf.leaf_coef, leaf.leaf_intercept_buf,
+        ):
+            free(leaf.leaf_coef)
+            leaf.leaf_coef = NULL
+            free(leaf.leaf_intercept_buf)
+            leaf.leaf_intercept_buf = NULL
+            return
+
+    leaf.leaf_n_coef = d
+    leaf.leaf_n_models = n_models
+
+
+cdef void _walk_and_fit(
+    TreeNode* node,
+    const double[::1, :] X,
+    const double[::1] y,
+    const double[::1] sample_weight,
+    const int* numeric_features,
+    const int d,
+    const int n_classes,
+    const bint task,
+    const double leaf_ridge,
+    int* sample_indices,
+    const int n_node_samples,
+    double* x_mean,
+    double* G,
+    double* rhs,
+    double* coef_buf,
+    double* w_buf,
+    double* z_buf,
+    double* coef_new_buf,
+) noexcept nogil:
+    cdef int left_count
+
+    if node.is_leaf:
+        _fit_one_leaf(
+            node,
+            X,
+            y,
+            sample_weight,
+            numeric_features,
+            d,
+            n_classes,
+            task,
+            leaf_ridge,
+            sample_indices,
+            n_node_samples,
+            x_mean,
+            G,
+            rhs,
+            coef_buf,
+            w_buf,
+            z_buf,
+            coef_new_buf,
+        )
+        return
+
+    left_count = partition_samples_inplace(
+        X,
+        sample_indices,
+        n_node_samples,
+        node.feature_idx,
+        node.threshold,
+        node.missing_go_left,
+        node.n_pair,
+        node.x,
+        node.pair,
+        node.n_category,
+        node.categories_go_left,
+    )
+
+    _walk_and_fit(
+        node.left, X, y, sample_weight,
+        numeric_features, d, n_classes, task, leaf_ridge,
+        sample_indices, left_count,
+        x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
+    )
+    _walk_and_fit(
+        node.right, X, y, sample_weight,
+        numeric_features, d, n_classes, task, leaf_ridge,
+        sample_indices + left_count, n_node_samples - left_count,
+        x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
+    )
+
+
+cdef void fit_linear_leaves(
+    TreeNode* root,
+    const double[::1, :] X,
+    const double[::1] y,
+    const double[::1] sample_weight,
+    const int* numeric_features,
+    const int n_numeric_features,
+    const double leaf_ridge,
+    const int n_samples,
+    const int n_classes,
+    const bint task,
+) noexcept nogil:
+    cdef int* sample_indices = NULL
+    cdef double* x_mean = NULL
+    cdef double* G = NULL
+    cdef double* rhs = NULL
+    cdef double* coef_buf = NULL
+    cdef double* w_buf = NULL
+    cdef double* z_buf = NULL
+    cdef double* coef_new_buf = NULL
+    cdef int i
+    cdef int d = n_numeric_features
+
+    if root == NULL or d <= 0 or n_samples <= 0:
+        return
+
+    sample_indices = <int*>malloc(n_samples * sizeof(int))
+    x_mean = <double*>malloc(d * sizeof(double))
+    G = <double*>malloc(d * d * sizeof(double))
+    rhs = <double*>malloc(d * sizeof(double))
+    coef_buf = <double*>malloc(d * sizeof(double))
+    coef_new_buf = <double*>malloc(d * sizeof(double))
+    w_buf = <double*>malloc(n_samples * sizeof(double))
+    z_buf = <double*>malloc(n_samples * sizeof(double))
+
+    if (sample_indices == NULL or x_mean == NULL or G == NULL or rhs == NULL
+        or coef_buf == NULL or coef_new_buf == NULL
+        or w_buf == NULL or z_buf == NULL):
+        if sample_indices != NULL: free(sample_indices)
+        if x_mean != NULL: free(x_mean)
+        if G != NULL: free(G)
+        if rhs != NULL: free(rhs)
+        if coef_buf != NULL: free(coef_buf)
+        if coef_new_buf != NULL: free(coef_new_buf)
+        if w_buf != NULL: free(w_buf)
+        if z_buf != NULL: free(z_buf)
+        return
+
+    for i in range(n_samples):
+        sample_indices[i] = i
+
+    _walk_and_fit(
+        root, X, y, sample_weight,
+        numeric_features, d, n_classes, task, leaf_ridge,
+        sample_indices, n_samples,
+        x_mean, G, rhs, coef_buf, w_buf, z_buf, coef_new_buf,
+    )
+
+    free(sample_indices)
+    free(x_mean)
+    free(G)
+    free(rhs)
+    free(coef_buf)
+    free(coef_new_buf)
+    free(w_buf)
+    free(z_buf)

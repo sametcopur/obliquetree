@@ -47,14 +47,20 @@ cdef WeakestLink find_weakest_link(TreeNode* node) noexcept nogil:
 cdef void free_subtree(TreeNode* node) noexcept nogil:
     if node == NULL:
         return
-        
+
     if node.x != NULL:
         free(node.x)
     if node.pair != NULL:
         free(node.pair)
     if node.categories_go_left != NULL:
         free(node.categories_go_left)
-        
+    if node.leaf_coef != NULL:
+        free(node.leaf_coef)
+    if node.leaf_intercept_buf != NULL:
+        free(node.leaf_intercept_buf)
+    if node.value_multiclass != NULL:
+        free(node.value_multiclass)
+
     free_subtree(node.left)
     free_subtree(node.right)
     free(node)
@@ -62,18 +68,18 @@ cdef void free_subtree(TreeNode* node) noexcept nogil:
 cdef void prune_subtree(TreeNode* node) noexcept nogil:
     if node == NULL or node.is_leaf:
         return
-        
+
     # Free children subtrees
     if node.left != NULL:
         free_subtree(node.left)
     if node.right != NULL:
         free_subtree(node.right)
-        
+
     # Reset node to leaf
     node.is_leaf = True
     node.left = NULL
     node.right = NULL
-    
+
     # Free split-related memory
     if node.x != NULL:
         free(node.x)
@@ -84,7 +90,15 @@ cdef void prune_subtree(TreeNode* node) noexcept nogil:
     if node.categories_go_left != NULL:
         free(node.categories_go_left)
         node.categories_go_left = NULL
-    
+    if node.leaf_coef != NULL:
+        free(node.leaf_coef)
+        node.leaf_coef = NULL
+    if node.leaf_intercept_buf != NULL:
+        free(node.leaf_intercept_buf)
+        node.leaf_intercept_buf = NULL
+    node.leaf_n_coef = 0
+    node.leaf_n_models = 0
+
     node.feature_idx = -1
     node.threshold = 0.0
     node.n_pair = 0

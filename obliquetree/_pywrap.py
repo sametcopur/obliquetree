@@ -102,6 +102,8 @@ class BaseTree(TreeClassifier):
         gamma: float,
         max_iter: int,
         relative_change: float,
+        linear_leaf: bool = False,
+        leaf_ridge: float = 1e-6,
     ) -> None:
         # Validate and assign parameters
         self.task = task
@@ -122,6 +124,8 @@ class BaseTree(TreeClassifier):
         )
         self.random_state = self._validate_random_state(random_state)
         self.categories = self._validate_categories(categories)
+        self.linear_leaf = self._validate_linear_leaf(linear_leaf, task)
+        self.leaf_ridge = self._validate_leaf_ridge(leaf_ridge)
         self._fit = False
         self._categories: dict[int, NDArray]
 
@@ -142,24 +146,33 @@ class BaseTree(TreeClassifier):
             self.use_oblique,
             self.task,
             1,
+            self.linear_leaf,
+            self.leaf_ridge,
         )
 
     def __getstate__(self):
         """Return the state for pickling."""
         state = super().__getstate__()
         state["_fit"] = self._fit
-
+        cats = getattr(self, "_categories", None)
+        if cats is not None:
+            state["_categories"] = {
+                int(k): np.asarray(v) for k, v in cats.items()
+            }
         return state
 
     def __setstate__(self, state):
         """Restore the state from pickle."""
         # Extract special attributes
         _fit = state.pop("_fit", False)
+        _categories = state.pop("_categories", None)
         super().__setstate__(state)
 
         # Restore state directly without re-initialization
         self.__dict__.update(state)
         self._fit = _fit
+        if _categories is not None:
+            self._categories = _categories
 
     def __repr__(self):
         param_str = (
@@ -175,7 +188,9 @@ class BaseTree(TreeClassifier):
             f"top_k={getattr(self, 'top_k', None)}, "
             f"gamma={getattr(self, 'gamma', None)}, "
             f"max_iter={getattr(self, 'max_iter', None)}, "
-            f"relative_change={getattr(self, 'relative_change', None)}"
+            f"relative_change={getattr(self, 'relative_change', None)}, "
+            f"linear_leaf={getattr(self, 'linear_leaf', None)}, "
+            f"leaf_ridge={getattr(self, 'leaf_ridge', None)}"
         )
         return f"{self.__class__.__name__}({param_str})"
 
@@ -284,6 +299,20 @@ class BaseTree(TreeClassifier):
             raise ValueError("use_oblique must be a boolean")
         return use_oblique
 
+    def _validate_linear_leaf(self, linear_leaf: bool, task: bool) -> bool:
+        if not isinstance(linear_leaf, bool):
+            raise ValueError("linear_leaf must be a boolean")
+        return linear_leaf
+
+    def _validate_leaf_ridge(self, leaf_ridge: float) -> float:
+        if not isinstance(leaf_ridge, (int, float)) or isinstance(leaf_ridge, bool):
+            raise ValueError("leaf_ridge must be a number")
+        if not np.isfinite(leaf_ridge):
+            raise ValueError("leaf_ridge must be finite (no NaN/Inf)")
+        if leaf_ridge < 0.0:
+            raise ValueError("leaf_ridge must be >= 0.0")
+        return float(leaf_ridge)
+
     def _coerce_feature_matrix(self, X: ArrayLike) -> NDArray:
         X = np.asarray(X, order="F", dtype=np.float64)
 
@@ -370,6 +399,11 @@ class BaseTree(TreeClassifier):
             return
         else:  # Classification
             unique_labels = np.unique(y)
+            if len(unique_labels) < 2:
+                raise ValueError(
+                    "Classification requires at least 2 distinct classes in y; "
+                    f"got {len(unique_labels)}."
+                )
             expected_labels = np.arange(len(unique_labels))
             if not np.array_equal(unique_labels, expected_labels):
                 raise ValueError(
@@ -398,6 +432,12 @@ class BaseTree(TreeClassifier):
                 )
 
             positive_mask = sample_weight > 0
+            if not positive_mask.any():
+                raise ValueError(
+                    "sample_weight must contain at least one positive value; "
+                    "all zeros leaves no effective training samples."
+                )
+
             if positive_mask.any():
                 min_val = np.min(sample_weight[positive_mask])
                 if min_val != 1:
@@ -413,6 +453,20 @@ class BaseTree(TreeClassifier):
             if np.any(np.isnan(X)) or np.any(np.isinf(X)):
                 raise ValueError(
                     "X cannot contain NaN or Inf values when use_oblique is True"
+                )
+
+        if self.linear_leaf and self.categories:
+            numeric_cols = [c for c in range(X.shape[1]) if c not in set(self.categories)]
+            if numeric_cols:
+                X_num = X[:, numeric_cols]
+                if np.any(np.isnan(X_num)) or np.any(np.isinf(X_num)):
+                    raise ValueError(
+                        "Numeric columns of X cannot contain NaN or Inf values when linear_leaf is True"
+                    )
+        elif self.linear_leaf:
+            if np.any(np.isnan(X)) or np.any(np.isinf(X)):
+                raise ValueError(
+                    "X cannot contain NaN or Inf values when linear_leaf is True"
                 )
 
         max_possible_pairs = (
@@ -469,6 +523,11 @@ class BaseTree(TreeClassifier):
             if np.isnan(category_values).any():
                 raise ValueError(
                     "X contains null values in the specified category columns. Please encode them before passing."
+                )
+
+            if np.isinf(category_values).any():
+                raise ValueError(
+                    "X contains Inf values in the specified category columns, which are not allowed."
                 )
 
             if is_fit:
@@ -562,6 +621,8 @@ class Classifier(BaseTree):
         gamma: float = 1.0,
         max_iter: int = 100,
         relative_change: float = 0.001,
+        linear_leaf: bool = False,
+        leaf_ridge: float = 1e-6,
     ):
         """
         A decision tree classifier supporting both traditional axis-aligned and oblique splits.
@@ -627,6 +688,38 @@ class Classifier(BaseTree):
             Early stopping threshold for L-BFGS optimization.
 
             - Only used when `use_oblique=True`.
+
+        linear_leaf : bool, default=False
+            If `True`, fit a regularized parametric leaf using only numeric
+            features (categorical features in `categories` are excluded):
+
+            - Binary classification: weighted logistic regression fit by
+              IRLS for a fixed number of iterations (25). The last finite
+              iterate is used; convergence to a tolerance is not strictly
+              required. Predict returns
+              ``sigmoid(intercept + coef · x)`` as ``P(class=1)``.
+            - Multi-class classification (``n_classes > 2``): multinomial
+              softmax regression with K-1 reference-class parametrization,
+              fit by Newton-Raphson on the full Hessian for a fixed number
+              of iterations (50). The last finite iterate is used. Predict
+              returns the softmax over per-class logits.
+
+            Falls back to the leaf class frequency when the leaf has fewer
+            samples than coefficients, when the Hessian/Gram matrix is
+            singular, when the Newton/IRLS step produces non-finite
+            parameters, or when any used feature is NaN/Inf at predict
+            time.
+
+        leaf_ridge : float, default=1e-6
+            Ridge regularization added to the leaf-level Hessian/Gram
+            diagonal when `linear_leaf=True`. For classification a tiny
+            internal floor of ``1e-10`` is always applied on top of the
+            user value because the multinomial softmax Hessian is
+            rank-deficient by construction without it; ``leaf_ridge=0.0``
+            therefore behaves as ``1e-10`` for classifiers. Tree leaves
+            are typically small, so a larger value (e.g. ``0.1`` -
+            ``1.0``) often improves probability calibration without
+            harming accuracy.
         """
         super().__init__(
             task=False,
@@ -643,6 +736,8 @@ class Classifier(BaseTree):
             gamma=gamma,
             max_iter=max_iter,
             relative_change=relative_change,
+            linear_leaf=linear_leaf,
+            leaf_ridge=leaf_ridge,
         )
 
     def fit(
@@ -734,6 +829,8 @@ class Regressor(BaseTree):
         gamma: float = 1.0,
         max_iter: int = 100,
         relative_change: float = 0.001,
+        linear_leaf: bool = False,
+        leaf_ridge: float = 1e-6,
     ):
         """
         A decision tree regressor supporting both traditional axis-aligned and oblique splits.
@@ -799,6 +896,24 @@ class Regressor(BaseTree):
             Early stopping threshold for L-BFGS optimization.
 
             - Only used when `use_oblique=True`.
+
+        linear_leaf : bool, default=False
+            If `True`, fit a weighted ordinary-least-squares model at each
+            terminal leaf using only numeric features (categorical features
+            listed in `categories` are excluded). At inference each leaf
+            returns ``intercept + sum(coef * x_numeric)``. Falls back to the
+            leaf mean when the leaf has fewer samples than coefficients,
+            when the Gram matrix is singular (Cholesky failure on
+            rank-deficient X with ``leaf_ridge=0``), or when any used
+            feature is NaN/Inf at predict time.
+
+        leaf_ridge : float, default=1e-6
+            Ridge added to the leaf normal-equations diagonal when
+            `linear_leaf=True`. ``0.0`` is honored exactly (true
+            unregularized OLS); on rank-deficient numeric features the
+            leaf will fall back to the mean instead. Pass a small
+            positive value (e.g. ``1e-8``) to enable a regularized fit on
+            correlated features.
         """
         super().__init__(
             task=True,
@@ -815,6 +930,8 @@ class Regressor(BaseTree):
             gamma=gamma,
             max_iter=max_iter,
             relative_change=relative_change,
+            linear_leaf=linear_leaf,
+            leaf_ridge=leaf_ridge,
         )
 
     def fit(

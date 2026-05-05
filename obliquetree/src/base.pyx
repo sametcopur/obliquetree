@@ -7,6 +7,7 @@ from .tree cimport (
     finalize_tree_metadata,
     predict,
     apply,
+    fit_linear_leaves,
     SortItem,
     CategoryStat,
 )
@@ -19,34 +20,42 @@ cdef void free_tree(TreeNode* node) noexcept nogil:
         if not node.is_leaf:
             free_tree(node.left)
             free_tree(node.right)
-        
+
         # Free all member pointers first
         if node.x != NULL:
             free(node.x)
             node.x = NULL
-            
+
         if node.pair != NULL:
             free(node.pair)
             node.pair = NULL
-            
+
         if node.categories_go_left != NULL:
             free(node.categories_go_left)
             node.categories_go_left = NULL
-            
+
         if node.value_multiclass != NULL:
             free(node.value_multiclass)
             node.value_multiclass = NULL
-            
+
+        if node.leaf_coef != NULL:
+            free(node.leaf_coef)
+            node.leaf_coef = NULL
+
+        if node.leaf_intercept_buf != NULL:
+            free(node.leaf_intercept_buf)
+            node.leaf_intercept_buf = NULL
+
         # Finally free the node itself
         free(node)
 
 cdef class TreeClassifier:
-    def __init__(self,  unsigned char max_depth, 
-                        int min_samples_leaf, 
+    def __init__(self,  unsigned char max_depth,
+                        int min_samples_leaf,
                         int min_samples_split,
-                        double min_impurity_decrease,  
-                        int random_state, 
-                        int n_pair, 
+                        double min_impurity_decrease,
+                        int random_state,
+                        int n_pair,
                         int top_k,
                         double gamma,
                         int max_iter,
@@ -55,7 +64,9 @@ cdef class TreeClassifier:
                         double ccp_alpha,
                         bint use_oblique,
                         bint task,
-                        int n_classes) -> None:
+                        int n_classes,
+                        bint linear_leaf,
+                        double leaf_ridge) -> None:
         self.max_depth = max_depth
         self.min_samples_leaf = min_samples_leaf
         self.min_impurity_decrease = min_impurity_decrease
@@ -71,16 +82,23 @@ cdef class TreeClassifier:
         self.ccp_alpha = ccp_alpha
         self.task = task
         self.n_classes = n_classes
+        self.linear_leaf = linear_leaf
+        self.leaf_ridge = leaf_ridge
 
         self.cat_ = len(categories) > 0
         self.rng_ = np.random.default_rng(random_state)
 
     def __cinit__(self, ):
         self.root = NULL
+        self.numeric_features_ = NULL
+        self.n_numeric_features_ = 0
 
     def __dealloc__(self):
         if self.root != NULL:
             free_tree(self.root)
+        if self.numeric_features_ != NULL:
+            free(self.numeric_features_)
+            self.numeric_features_ = NULL
             
     def __getstate__(self):
         return export_tree(self)
@@ -89,6 +107,8 @@ cdef class TreeClassifier:
         """Pickle'dan durum değerlerini yükle."""
         cdef dict params = state["params"]
         cdef dict tree = state["tree"]
+        cdef list numeric_features
+        cdef int i
 
         self.max_depth = params.get('max_depth', 255)
         self.min_samples_leaf = params.get('min_samples_leaf', 1)
@@ -103,6 +123,8 @@ cdef class TreeClassifier:
         self.categories = params.get('categories', [])
         self.ccp_alpha = params.get('ccp_alpha', 0.0)
         self.use_oblique = params.get('use_oblique', True)
+        self.linear_leaf = params.get('linear_leaf', False)
+        self.leaf_ridge = params.get('leaf_ridge', 0.0)
 
         self.cat_ = params.get('cat_', False)
         self.rng_ = np.random.default_rng(self.random_state)
@@ -110,6 +132,20 @@ cdef class TreeClassifier:
         self.task = params["task"]
         self.n_classes = params['n_classes']
         self.n_features = params['n_features']
+
+        if self.numeric_features_ != NULL:
+            free(self.numeric_features_)
+            self.numeric_features_ = NULL
+        self.n_numeric_features_ = 0
+
+        numeric_features = params.get('numeric_features', None)
+        if numeric_features is not None and len(numeric_features) > 0:
+            self.n_numeric_features_ = len(numeric_features)
+            self.numeric_features_ = <int*>malloc(self.n_numeric_features_ * sizeof(int))
+            if self.numeric_features_ == NULL:
+                raise MemoryError()
+            for i in range(self.n_numeric_features_):
+                self.numeric_features_[i] = numeric_features[i]
 
         self.root = deserialize_tree(tree, self.n_features, self.n_classes)
         if self.root != NULL:
@@ -119,7 +155,8 @@ cdef class TreeClassifier:
         cdef int n_samples = X.shape[0]
         cdef int n_columns = X.shape[1]
         cdef int i
-        
+        cdef int n_numeric
+
         # Temel bellek ayırma işlemleri
         cdef SortItem* sort_buffer = NULL
         cdef int* sample_indices = NULL
@@ -127,14 +164,19 @@ cdef class TreeClassifier:
         cdef bint* is_categorical = NULL
         cdef CategoryStat* categorical_stats = NULL
         cdef bint* is_integer = NULL
-        
-    
+
+
         try:
             self.n_features = n_columns
 
             if self.root != NULL:
                 free_tree(self.root)
                 self.root = NULL
+
+            if self.numeric_features_ != NULL:
+                free(self.numeric_features_)
+                self.numeric_features_ = NULL
+            self.n_numeric_features_ = 0
 
             # Bellek ayırma işlemleri
             sort_buffer = <SortItem*>malloc(n_samples * sizeof(SortItem))
@@ -143,7 +185,7 @@ cdef class TreeClassifier:
             is_categorical = <bint*>calloc(n_columns, sizeof(bint))
             is_integer = <bint*>malloc(n_columns * sizeof(bint))
 
-            if ((sort_buffer == NULL) or (sample_indices == NULL) or 
+            if ((sort_buffer == NULL) or (sample_indices == NULL) or
                 (nan_indices == NULL) or (is_categorical == NULL) or
                  (is_integer == NULL)
                 ):
@@ -156,15 +198,31 @@ cdef class TreeClassifier:
 
                 if categorical_stats == NULL:
                     raise MemoryError()
-            
+
             # İndeksleri hazırla
             for i in range(n_samples):
                 sample_indices[i] = i
-            
+
             # Kategorik değişkenleri işaretle
             for i in self.categories:
                 is_categorical[i] = 1
-            
+
+            # Numeric feature index list (used by linear-leaf fit + predict)
+            n_numeric = 0
+            for i in range(n_columns):
+                if not is_categorical[i]:
+                    n_numeric += 1
+            if n_numeric > 0:
+                self.numeric_features_ = <int*>malloc(n_numeric * sizeof(int))
+                if self.numeric_features_ == NULL:
+                    raise MemoryError()
+                self.n_numeric_features_ = n_numeric
+                n_numeric = 0
+                for i in range(n_columns):
+                    if not is_categorical[i]:
+                        self.numeric_features_[n_numeric] = i
+                        n_numeric += 1
+
             # Ağacı oluştur
             self.root = build_tree_recursive(
                 self.task,
@@ -182,7 +240,7 @@ cdef class TreeClassifier:
                 self.n_pair,
                 self.top_k,
                 self.gamma,
-                self.max_iter, 
+                self.max_iter,
                 self.relative_change,
                 self.rng_,
                 self.use_oblique,
@@ -191,13 +249,28 @@ cdef class TreeClassifier:
                 sample_weight,
                 is_integer,
             )
-            
+
             if self.ccp_alpha > 0.0:
                 prune_tree(self.root, self.ccp_alpha)
 
+            if (self.linear_leaf and
+                    self.root != NULL and self.n_numeric_features_ > 0):
+                fit_linear_leaves(
+                    self.root,
+                    X,
+                    y,
+                    sample_weight,
+                    self.numeric_features_,
+                    self.n_numeric_features_,
+                    self.leaf_ridge,
+                    n_samples,
+                    self.n_classes,
+                    self.task,
+                )
+
             if self.root != NULL:
                 finalize_tree_metadata(self.root)
-                
+
         finally:
             free(sort_buffer)
             free(sample_indices)
@@ -207,7 +280,7 @@ cdef class TreeClassifier:
 
             if categorical_stats != NULL:
                 free(categorical_stats)
-    
+
         return self
 
     cpdef apply(self, double[::1, :] X):
@@ -247,7 +320,17 @@ cdef class TreeClassifier:
         else:
             out = np.zeros((n_samples, 1), dtype=np.float64)
 
-        predict(self.root, X, out, n_samples, self.n_classes)
+        predict(
+            self.root,
+            X,
+            out,
+            n_samples,
+            self.n_classes,
+            self.linear_leaf,
+            self.numeric_features_,
+            self.n_numeric_features_,
+            self.task == 0,
+        )
 
         if (self.n_classes <= 2) and (self.task == 0):
             proba = np.empty((n_samples, self.n_classes), dtype=np.float64)

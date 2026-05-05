@@ -20,6 +20,19 @@ cdef dict _recurse(const TreeNode* node):
             base.update({
                 "value": node.value
             })
+        if (node.leaf_coef != NULL and node.leaf_intercept_buf != NULL
+                and node.leaf_n_coef > 0 and node.leaf_n_models > 0):
+            base.update({
+                "leaf_coef": [
+                    node.leaf_coef[i]
+                    for i in range(node.leaf_n_models * node.leaf_n_coef)
+                ],
+                "leaf_intercept": [
+                    node.leaf_intercept_buf[i] for i in range(node.leaf_n_models)
+                ],
+                "leaf_n_models": node.leaf_n_models,
+                "leaf_n_coef": node.leaf_n_coef,
+            })
         return base
 
     # Add common non-leaf attributes (except left/right)
@@ -97,6 +110,11 @@ cpdef dict export_tree(TreeClassifier tree):
     if tree.root == NULL:
         raise ValueError("Tree is not fitted yet!")
     
+    cdef int i
+    numeric_features = None
+    if tree.numeric_features_ != NULL and tree.n_numeric_features_ > 0:
+        numeric_features = [tree.numeric_features_[i] for i in range(tree.n_numeric_features_)]
+
     # Export parameters
     params = {
         'max_depth': tree.max_depth,
@@ -115,7 +133,10 @@ cpdef dict export_tree(TreeClassifier tree):
         'task': tree.task,
         'n_classes': tree.n_classes,
         'n_features': tree.n_features,
-        'cat_': tree.cat_
+        'cat_': tree.cat_,
+        'linear_leaf': tree.linear_leaf,
+        'leaf_ridge': tree.leaf_ridge,
+        'numeric_features': numeric_features,
     }
     
     # Return combined dictionary
@@ -160,7 +181,11 @@ cdef TreeNode* deserialize_tree(dict tree_dict, int n_features, int n_classes) e
     node.threshold = 0.0
     node.n_pair = 0
     node.n_category = 0
-    
+    node.leaf_coef = NULL
+    node.leaf_intercept_buf = NULL
+    node.leaf_n_coef = 0
+    node.leaf_n_models = 0
+
     # Set basic node properties
     node.is_leaf = tree_dict['is_leaf']
     node.value = tree_dict.get('value', 0.0)
@@ -168,7 +193,7 @@ cdef TreeNode* deserialize_tree(dict tree_dict, int n_features, int n_classes) e
     node.n_samples = tree_dict.get('n_samples', 0)
     node.missing_go_left = tree_dict.get('missing_go_left', 1)
     node.n_classes = n_classes
-    
+
     # Handle multiclass values if present
     if 'values' in tree_dict:
         node.value_multiclass = <double*>malloc(n_classes * sizeof(double))
@@ -177,6 +202,42 @@ cdef TreeNode* deserialize_tree(dict tree_dict, int n_features, int n_classes) e
             raise MemoryError("Failed to allocate memory for value_multiclass")
         for i in range(n_classes):
             node.value_multiclass[i] = tree_dict['values'][i]
+
+    # Restore leaf linear model if present
+    if 'leaf_coef' in tree_dict:
+        leaf_coef_list = tree_dict['leaf_coef']
+        leaf_intercept_obj = tree_dict.get('leaf_intercept', 0.0)
+        if isinstance(leaf_intercept_obj, (list, tuple)):
+            leaf_intercept_list = list(leaf_intercept_obj)
+        else:
+            leaf_intercept_list = [float(leaf_intercept_obj)]
+        node.leaf_n_models = tree_dict.get('leaf_n_models', len(leaf_intercept_list))
+        if node.leaf_n_models > 0:
+            node.leaf_n_coef = tree_dict.get(
+                'leaf_n_coef', len(leaf_coef_list) // node.leaf_n_models
+            )
+        else:
+            node.leaf_n_coef = 0
+        total_coef = node.leaf_n_models * node.leaf_n_coef
+        if total_coef > 0 and len(leaf_coef_list) >= total_coef:
+            node.leaf_coef = <double*>malloc(total_coef * sizeof(double))
+            node.leaf_intercept_buf = <double*>malloc(node.leaf_n_models * sizeof(double))
+            if not node.leaf_coef or not node.leaf_intercept_buf:
+                if node.leaf_coef != NULL:
+                    free(node.leaf_coef)
+                if node.leaf_intercept_buf != NULL:
+                    free(node.leaf_intercept_buf)
+                if node.value_multiclass != NULL:
+                    free(node.value_multiclass)
+                free(node)
+                raise MemoryError("Failed to allocate memory for leaf_coef")
+            for i in range(total_coef):
+                node.leaf_coef[i] = leaf_coef_list[i]
+            for i in range(node.leaf_n_models):
+                node.leaf_intercept_buf[i] = leaf_intercept_list[i]
+        else:
+            node.leaf_n_models = 0
+            node.leaf_n_coef = 0
     
     # If not a leaf node, handle split information
     if not node.is_leaf:

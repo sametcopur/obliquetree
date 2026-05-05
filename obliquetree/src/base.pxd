@@ -9,18 +9,22 @@ cdef class TreeClassifier:
     cdef public double min_impurity_decrease
     cdef public int random_state
     cdef public int n_pair
-    cdef public int top_k 
+    cdef public int top_k
     cdef public object rng_
     cdef public double gamma
-    cdef public int max_iter 
+    cdef public int max_iter
     cdef public double relative_change
     cdef public bint use_oblique
     cdef public list categories
     cdef public double ccp_alpha
     cdef public bint task
     cdef public int n_classes
-    cdef bint cat_ 
+    cdef bint cat_
     cdef public int n_features
+    cdef public bint linear_leaf
+    cdef public double leaf_ridge
+    cdef int* numeric_features_
+    cdef int n_numeric_features_
 
     cpdef fit(self, double[::1, :] X, double[::1] y, double[::1] sample_weight)
     cpdef apply(self, double[::1, :] X)
